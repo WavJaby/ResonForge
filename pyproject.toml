@@ -1,0 +1,70 @@
+[project]
+name = "resonforge"
+version = "0.1.0"
+description = "BS-RoFormer separation, MuScriptor transcription, and MIDI mixdown pipeline"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "basic-pitch[onnx]==0.4.0",
+    "bs-roformer-infer @ git+https://github.com/openmirlab/bs-roformer-infer@04cfa4be2d04ad5164c6f7e97ff31f37b0b162fe",
+    "librosa>=0.11,<0.12",
+    "mido==1.3.3",
+    "mt3-infer[torch]==0.2.0",
+    "muscriptor",
+    "numpy==2.4.6",
+    "resampy==0.4.3",
+    "setuptools<81",
+    "soundfile==0.14.0",
+    "torch==2.6.0+cu124",
+    "torchaudio==2.6.0+cu124",
+    "torchvision==0.21.0+cu124",
+    "transformers==4.44.2",
+]
+
+[project.scripts]
+resonforge = "resonforge.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.14",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/resonforge"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv]
+# Windows/Linux only; macOS conflicts with MuScriptor's NumPy constraint.
+environments = [
+    "sys_platform == 'win32'",
+    "sys_platform == 'linux'",
+]
+cache-dir = ".uv-cache"
+exclude-dependencies = ["tensorflow", "tensorflow-macos"]
+override-dependencies = ["resampy==0.4.3"]
+
+[tool.pytest.ini_options]
+addopts = ["--basetemp=.pytest-tmp"]
+pythonpath = [".", "src"]
+testpaths = ["test"]
+
+[tool.ruff.lint]
+select = ["B", "E4", "E7", "E9", "F", "I", "SIM", "UP"]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+muscriptor = { path = "third_party/muscriptor", editable = true }
+torch = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+

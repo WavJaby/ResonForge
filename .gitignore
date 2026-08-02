@@ -1,0 +1,16 @@
+.venv/
+.uv-cache/
+.idea/
+.junie/
+.pytest-tmp/
+.*cache/
+.codex*/
+environments/*/.venv/
+input/
+output/
+models/
+papers/
+docs/
+*.log
+__pycache__
+*.py[cod]

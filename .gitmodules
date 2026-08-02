@@ -1,4 +1,4 @@
 [submodule "muscriptor"]
-	path = muscriptor
+	path = third_party/muscriptor
 	url = https://github.com/WavJaby/muscriptor.git
-	branch = audio-one-stop
+	branch = resonforge
