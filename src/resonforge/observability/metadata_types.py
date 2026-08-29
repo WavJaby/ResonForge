@@ -25,8 +25,6 @@ class StemMetadata(TypedDict, total=False):
     instruments: str
     selected_for_transcription: bool
     selection_reason: str
-    adaptive_gate: dict[str, object]
-    hard_zero: dict[str, object]
     presence: dict[str, object]
     presence_metrics: dict[str, object]
     transcription: dict[str, Any]
@@ -50,13 +48,17 @@ class RunMetadata(TypedDict, total=False):
     started_at: str
     finished_at: str | None
     elapsed_seconds: float | None
-    command: dict[str, Any]
+    performance: dict[str, float | int]
+    effective_flags: dict[str, Any]
     input: AudioFileMetadata
     software: dict[str, Any]
     models: dict[str, Any]
     separation: dict[str, Any]
     stems: dict[str, StemMetadata]
     transcription_timing: dict[str, Any]
+    telemetry: dict[str, Any]
+    scheduler_liveness: dict[str, Any]
+    artifacts: list[dict[str, Any]]
     tempo: TempoResult | None
     outputs: OutputMetadata
     error: dict[str, str] | None

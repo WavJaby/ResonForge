@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .buffer import AudioBuffer
+
 
 @dataclass(frozen=True)
 class StemPresenceMetrics:
@@ -90,6 +92,39 @@ def analyze_stem_presence(
         coverage_above_minus_40_percent=float(
             100.0 * np.mean(block_dbfs > -40.0)
         ),
+        loudest_1s_dbfs=loudest_window(1000.0),
+        loudest_200ms_dbfs=loudest_window(200.0),
+    )
+
+
+def analyze_stem_presence_buffer(
+    audio: AudioBuffer,
+    *,
+    identity: Path,
+    block_ms: float = 100.0,
+) -> StemPresenceMetrics:
+    """Analyze an in-memory stem without publishing a derivative WAV."""
+    block_frames = max(1, round(audio.sample_rate * block_ms / 1000.0))
+    padding = (-len(audio.samples)) % block_frames
+    padded = np.pad(audio.samples, ((0, padding), (0, 0)))
+    blocks = padded.reshape(-1, block_frames, audio.samples.shape[1])
+    powers = np.mean(np.square(blocks, dtype=np.float64), axis=(1, 2))
+    block_dbfs = 10.0 * np.log10(np.maximum(powers, 1e-24))
+
+    def loudest_window(window_ms: float) -> float:
+        count = max(1, round(window_ms / block_ms))
+        if powers.size <= count:
+            return _dbfs(float(np.sqrt(np.mean(powers))))
+        cumulative = np.concatenate(([0.0], np.cumsum(powers)))
+        means = (cumulative[count:] - cumulative[:-count]) / count
+        return _dbfs(float(np.sqrt(np.max(means))))
+
+    return StemPresenceMetrics(
+        path=identity,
+        duration_seconds=audio.duration_seconds,
+        global_rms_dbfs=_dbfs(float(np.sqrt(np.mean(powers)))),
+        block_p99_dbfs=float(np.percentile(block_dbfs, 99)),
+        coverage_above_minus_40_percent=float(100.0 * np.mean(block_dbfs > -40.0)),
         loudest_1s_dbfs=loudest_window(1000.0),
         loudest_200ms_dbfs=loudest_window(200.0),
     )

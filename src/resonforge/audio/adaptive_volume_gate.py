@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .buffer import AudioBuffer
+
 __all__ = [
     "GATE_PRESETS",
     "GatePreset",
@@ -49,6 +51,14 @@ GATE_PRESETS: dict[str, GatePreset] = {
     "extreme": GatePreset(
         "extreme", -6.0, 20.0, 8.0, 120.0, 20.0, 24.0, 0.0, 6.0
     ),
+    # Threshold: reference - 20 dB, i.e. below the audible floor of a separated
+    # stem, so only inaudible material is touched. The steep exponent, zero
+    # floor and short release then drive that material to true silence fast
+    # enough for the activity splitter to find gaps that "balanced" bridges.
+    # Audible sustain sits above the threshold and passes at unity gain.
+    "split": GatePreset(
+        "split", 20.0, 20.0, 8.0, 120.0, 20.0, 16.0, 0.0, 10.0
+    ),
 }
 
 
@@ -76,6 +86,34 @@ class GateResult:
         result["input_path"] = str(self.input_path)
         result["output_path"] = str(self.output_path)
         return result
+
+
+@dataclass(frozen=True)
+class GateBufferResult:
+    audio: AudioBuffer
+    metrics: dict[str, object]
+
+
+def hard_zero_buffer(
+    source: AudioBuffer,
+    *,
+    threshold_dbfs: float = -80.0,
+    block_ms: float = 20.0,
+) -> GateBufferResult:
+    block_size = max(1, round(source.sample_rate * block_ms / 1000.0))
+    rms = _block_rms(source.samples, block_size)
+    zero_blocks = rms < 10.0 ** (threshold_dbfs / 20.0)
+    zero_samples = np.repeat(zero_blocks, block_size)[: len(source.samples)]
+    processed = source.samples.copy()
+    processed[zero_samples] = 0.0
+    return GateBufferResult(
+        source.replace(processed),
+        {
+            "threshold_dbfs": threshold_dbfs,
+            "block_ms": block_ms,
+            "blocks_zeroed_percent": float(100.0 * np.mean(zero_blocks)),
+        },
+    )
 
 
 def get_gate_preset(preset: str | GatePreset) -> GatePreset:
@@ -278,6 +316,115 @@ def _smooth_gain(
             + (1.0 - alpha) * desired[index]
         )
     return envelope
+
+
+def adaptive_volume_gate_buffer(
+    source: AudioBuffer,
+    *,
+    preset: str | GatePreset = "balanced",
+    threshold_offset_db: float | None = None,
+    threshold_dbfs: float | None = None,
+    zero_below_dbfs: float | None = -80.0,
+) -> GateBufferResult:
+    """Apply the production gate while retaining processed audio in memory."""
+    selected = get_gate_preset(preset)
+    selected_offset = (
+        threshold_offset_db
+        if threshold_offset_db is not None
+        else selected.threshold_offset_db
+    )
+    if threshold_dbfs is not None:
+        selected_offset = None
+    _validate_parameters(
+        block_ms=selected.block_ms,
+        attack_ms=selected.attack_ms,
+        release_ms=selected.release_ms,
+        lookahead_ms=selected.lookahead_ms,
+        exponent=selected.exponent,
+        floor=selected.floor,
+        auto_active_headroom_db=selected.auto_active_headroom_db,
+        threshold_offset_db=selected_offset,
+        threshold_dbfs=threshold_dbfs,
+        zero_below_dbfs=zero_below_dbfs,
+    )
+    audio = source.samples
+    block_size = max(1, round(source.sample_rate * selected.block_ms / 1000.0))
+    rms = _block_rms(audio, block_size)
+    if threshold_dbfs is not None:
+        threshold_mode = "absolute"
+        resolved_threshold_dbfs = float(threshold_dbfs)
+        reference = _legacy_active_reference(rms)
+        reference_dbfs = _optional_db(reference or 0.0)
+        nonzero = rms[rms > SILENCE_EPSILON]
+        noise_floor_dbfs = (
+            float(np.percentile(db(nonzero), 10)) if nonzero.size else None
+        )
+    elif selected_offset is not None:
+        threshold_mode = "offset"
+        reference = _legacy_active_reference(rms)
+        reference_dbfs = _optional_db(reference or 0.0)
+        if reference is None:
+            resolved_threshold_dbfs = -120.0
+            noise_floor_dbfs = None
+        else:
+            resolved_threshold_dbfs = float(db(reference) - selected_offset)
+            nonzero = rms[rms > SILENCE_EPSILON]
+            noise_floor_dbfs = float(np.percentile(db(nonzero), 10))
+    else:
+        threshold_mode = "auto"
+        resolved_threshold_dbfs, reference_dbfs, noise_floor_dbfs = (
+            _automatic_threshold(
+                rms,
+                active_headroom_db=selected.auto_active_headroom_db,
+            )
+        )
+    threshold = 10.0 ** (resolved_threshold_dbfs / 20.0)
+    desired = np.ones_like(rms)
+    below = rms < threshold
+    desired[below] = np.maximum(
+        (rms[below] / threshold) ** selected.exponent,
+        selected.floor,
+    )
+    desired = _apply_lookahead(
+        desired,
+        int(np.ceil(selected.lookahead_ms / selected.block_ms)),
+    )
+    envelope = _smooth_gain(
+        desired,
+        block_ms=selected.block_ms,
+        attack_ms=selected.attack_ms,
+        release_ms=selected.release_ms,
+    )
+    positions = np.arange(len(audio), dtype=np.float64) / block_size
+    gain = np.interp(positions, np.arange(len(envelope)), envelope)
+    processed = audio * gain[:, None]
+    if zero_below_dbfs is not None:
+        processed_rms = _block_rms(processed, block_size)
+        zero_blocks = processed_rms < 10.0 ** (zero_below_dbfs / 20.0)
+        processed[np.repeat(zero_blocks, block_size)[: len(processed)]] = 0.0
+    else:
+        zero_blocks = np.zeros_like(rms, dtype=bool)
+    input_rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+    output_rms = float(np.sqrt(np.mean(np.square(processed, dtype=np.float64))))
+    return GateBufferResult(
+        source.replace(processed),
+        {
+            "preset": selected.name,
+            "threshold_mode": threshold_mode,
+            "sample_rate": source.sample_rate,
+            "duration_seconds": source.duration_seconds,
+            "reference_dbfs": reference_dbfs,
+            "noise_floor_dbfs": noise_floor_dbfs,
+            "threshold_dbfs": resolved_threshold_dbfs,
+            "input_rms_dbfs": _optional_db(input_rms),
+            "output_rms_dbfs": _optional_db(output_rms),
+            "blocks_reduced_over_6db_percent": float(100.0 * np.mean(envelope < 0.5)),
+            "blocks_below_threshold_percent": float(100.0 * np.mean(below)),
+            "blocks_at_unity_percent": float(100.0 * np.mean(envelope >= 0.999)),
+            "zero_below_dbfs": zero_below_dbfs,
+            "blocks_zeroed_percent": float(100.0 * np.mean(zero_blocks)),
+        },
+    )
 
 
 def adaptive_volume_gate(
