@@ -67,7 +67,7 @@ class RegionProducerSession:
         )
         from muscriptor.recovery_runtime import (
             RecoveryCandidateGroupRequest,
-            RecoveryCandidateRequest,
+            RecoveryCandidateSpec,
         )
 
         if self.cancelled():
@@ -106,18 +106,27 @@ class RegionProducerSession:
                 (
                     GenerationRequest,
                     GenerationControlRequest,
-                    RecoveryCandidateRequest,
+                    RecoveryCandidateSpec,
                     RecoveryCandidateGroupRequest,
                 ),
             ):
                 ready_order = f"{self.ready_prefix}:{self.generation_requests:06d}"
                 self.generation_requests += 1
-                if (
-                    self.trace_collector is not None
-                    and not isinstance(
+                if self.trace_collector is not None and isinstance(
+                    event, RecoveryCandidateSpec
+                ):
+                    # The trace fields live on the inner request; the spec is
+                    # only the routing envelope.
+                    event = dataclasses.replace(
                         event,
-                        (GenerationControlRequest, RecoveryCandidateGroupRequest),
+                        request=dataclasses.replace(
+                            event.request,
+                            trace_collector=self.trace_collector,
+                            trace_context=(type(event).__name__, ready_order),
+                        ),
                     )
+                elif self.trace_collector is not None and isinstance(
+                    event, GenerationRequest
                 ):
                     event = dataclasses.replace(
                         event,

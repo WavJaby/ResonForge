@@ -244,7 +244,7 @@ def _prepare_recovery_continuous_work(
 
 # `MAX_ARENA_WIDTH = 20` and `MAX_SECONDARY_ARENA_WIDTH = 2` stood here, deleted with the condition they defended against.
 # Both were bands against "the lane that opens first takes the device" -- real and repeatedly reproduced: a lane opened wide, used a fraction, finished its burst in seconds and held the rest all run
-# while the co-resident lane sat on its floor of 1, roughly doubling the wall. Instances: docs/REPORT.md R11.
+# while the co-resident lane sat on its floor of 1, roughly doubling the wall (R11).
 # That condition holds only while a lane opens at *what fits*. It doesn't survive `_resolve_arena_width` asking `_run_demand_width` instead -- a lane now opens at the rows it has work for, so there's nothing for the first lane to take.
 # ! re-check if either is ever reintroduced: the transient reserve is a bootstrap constant until the first measurement lands, and transient scales with width, so a width chosen before that measurement is sized against a water line that then rises behind it.
 # `--batch-size` still forces a per-model ceiling, now the only way one exists.
@@ -433,7 +433,7 @@ def _declare_kv_pool(
     wanted = per_row * (rows + 1) + _prefill_row_blocks(model_obj) * rows
     # And no more than the device can hold. The docstring says a large declaration doesn't occupy a large amount -- true of a reservation, not of this:
     # `KVBlockPool._ensure_storage` is one `torch.empty` over the whole declared extent, so the pool occupies every byte it declares as soon as anything leases from it.
-    # Over-declaring once put more on the card than it had, and Windows backs an oversubscribed allocation with system memory instead of failing -- a silent 4.9x on every decode step (docs/REPORT.md R11).
+    # Over-declaring once put more on the card than it had, and Windows backs an oversubscribed allocation with system memory instead of failing -- a silent 4.9x on every decode step (R11).
     #
     # `empty_cache` first or the reading isn't the truth: the caching allocator holds a GiB or two per loaded model that `mem_get_info` counts as used and torch would hand straight back.
     #
@@ -504,8 +504,8 @@ def _declare_kv_pool(
                 roles_present=roles_present,
             )
             spare = device_ledger.lane_bytes(budget, role)
-            # Never below one row across every layer: a supply that can't fund the lane's floor is the terminal capacity outcome and belongs to the block pool's `DeviceCannotHoldOneRow`, not a silent narrowing here.
-            # ! that symbol does not exist -- `row_floor` is computed and nothing raises when the quotient is zero. docs/deadlock/ capture C.
+            # Never below one row across every layer: a supply that can't fund the lane's floor is the terminal capacity outcome and belongs to the scheduler's `DeviceCannotHoldOneRow` (model_workers), not a silent narrowing here.
+            # That guard exists since 2026-08-29: `_kv_row_capacity` raises when a WHOLE supply funds zero rows (deadlock capture C).
             return max(per_row, min(wanted, spare // page))
 
         wanted = blocks_for(pool_budget.transient_bytes_for(priced_rows))
@@ -711,8 +711,7 @@ def _configure_loaded_model(
     # cost appears only where ragged fires.
     #
     # Do not default it on without a device where that reverses -- and turning
-    # it on is an O1 event either way. Arms, p-values and the void first
-    # attempt: `docs/HANDOFF.md`.
+    # it on is an O1 event either way.
     if os.environ.get(PACKED_PREFILL_VARIABLE) == "1":
         model.configure_packed_prefill(True)
     LOGGER.info(
@@ -1255,7 +1254,7 @@ def _transcribe_scheduled(
                         )
                         from muscriptor.recovery_runtime import (
                             RecoveryCandidateGroupRequest,
-                            RecoveryCandidateRequest,
+                            RecoveryCandidateSpec,
                         )
 
                         from resonforge.transcribers.muscriptor.runtime.continuous_generation import (
@@ -1272,7 +1271,7 @@ def _transcribe_scheduled(
                         )
                         submissions = []
                         for request in submitted_requests:
-                            is_recovery = isinstance(request, RecoveryCandidateRequest)
+                            is_recovery = isinstance(request, RecoveryCandidateSpec)
                             is_control = isinstance(request, GenerationControlRequest)
                             job_type = (
                                 "control"
