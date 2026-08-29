@@ -7,6 +7,7 @@ import gc
 import itertools
 import logging
 import math
+import os
 import queue
 import sys
 import threading
@@ -548,6 +549,9 @@ class _RunTelemetry:
     """
 
     physical_steps: int = 0
+    #: Device tokens computed past a row's own stop -- EOS, temporal-floor break, max_gen_len -- inside a quantum. Checkpoint overrun is NOT waste (retained as `pending_tokens`).
+    #: Load-bearing for S5 (host-async decode): speculation waste lands here, and the q8 overshoot reading was unconfirmed for lack of exactly this counter.
+    wasted_token_rows: int = 0
     active_steps_by_width: dict[int, int] = field(default_factory=dict)
     prefill_batches_by_width: dict[int, int] = field(default_factory=dict)
     condition_batches_by_width: dict[int, int] = field(default_factory=dict)
@@ -733,6 +737,12 @@ class ModelWorkerPool(Generic[_ModelT]):
         ] = set()
         self._recent_transitions: list[dict[str, object]] = []
         self._last_decode_quantum_finished_at: float | None = None
+        # S5c host-async decode (docs/mixed-batch/PLAN.md): the decode action
+        # launches a replay and consumes it on the NEXT decode dispatch, so the
+        # scheduler's own work between the two runs beside the device instead
+        # of after it. Off by default until the A/B lands; the toggle is
+        # temporary and is removed with the measurement either way.
+        self._async_decode = os.environ.get("RESONFORGE_ASYNC_DECODE", "") == "1"
         self._liveness_error: SchedulerLivenessError | None = None
         self._requested_terminal_error: BaseException | None = None
         self._producer_waits: dict[tuple[int, int, int], _ProducerDecisionWait] = {}
@@ -2890,6 +2900,13 @@ class ModelWorkerPool(Generic[_ModelT]):
         # not a decode dispatch", and the four fields are simply absent.
         dispatch_readiness: dict[str, int] | None = None
         try:
+            # S5c: every non-decode action may mutate slots, pages or arenas,
+            # so every in-flight quantum on this device is consumed first --
+            # decode consumes its own run's inline. A no-op while nothing is
+            # in flight, which is always the case with async decode off.
+            if action != "decode":
+                for candidate in runs_by_id.values():
+                    self._drain_in_flight_quantum(candidate)
             if action == "release_admit":
                 action_adapter_started = time.perf_counter()
                 loaded, model_started, model_finished = (
@@ -3170,8 +3187,8 @@ class ModelWorkerPool(Generic[_ModelT]):
             # and buys **zero** wall, because removing device idle cannot help a
             # workload that is not waiting on the device. A wider quantum also
             # overshoots, stepping rows a narrower boundary would have stopped;
-            # that reading is *unconfirmed* because `wasted_token_rows` never
-            # reaches metadata (scheduler-fill arms).
+            # `wasted_token_rows` reaches metadata since 2026-08-30 (S5a), so a
+            # rerun can now confirm the overshoot half of that reading.
 
             quantum_steps = 4
             run.stats.quantum_steps_by_size[quantum_steps] = (
@@ -3188,11 +3205,34 @@ class ModelWorkerPool(Generic[_ModelT]):
                     decode_started - self._last_decode_quantum_finished_at,
                 )
                 run.stats.scheduler_boundary_gap_count += 1
-            stats = session.run_quantum(
-                quantum_steps,
-                lambda item, result: completed.append((item, result)),
-                checkpointed=lambda item, result: completed.append((item, result)),
-            )
+            if self._async_decode and getattr(
+                session, "split_decode_supported", False
+            ):
+                # S5c: consume the previous launch's tokens (a full sync), then
+                # launch the next replay and return while it runs -- the
+                # scheduler's decision work and the other lane's dispatches
+                # execute beside it. The first dispatch of a burst launches
+                # only; the last is consumed by a later dispatch or by
+                # `_drain_in_flight_quantum` on the next slot-mutating action.
+                stats = (
+                    session.consume_quantum(
+                        lambda item, result: completed.append((item, result)),
+                        checkpointed=lambda item, result: completed.append(
+                            (item, result)
+                        ),
+                    )
+                    if session.quantum_in_flight
+                    else None
+                )
+                session.launch_quantum(quantum_steps)
+            else:
+                stats = session.run_quantum(
+                    quantum_steps,
+                    lambda item, result: completed.append((item, result)),
+                    checkpointed=lambda item, result: completed.append(
+                        (item, result)
+                    ),
+                )
             self._last_decode_quantum_finished_at = time.perf_counter()
             if waterfall_action == "session_init":
                 session_first_decode_span = (
@@ -3311,12 +3351,39 @@ class ModelWorkerPool(Generic[_ModelT]):
                 slots_before,
                 dispatch_readiness=dispatch_readiness,
             )
+        if stats is not None:
+            self._accumulate_quantum_stats(run, stats)
+        self._publish_quantum_completions(run, completed)
+        return ActionResult(
+            ActionResultStatus.APPLIED,
+            selected_action,
+            state.version,
+        )
+
+    def _accumulate_quantum_stats(
+        self,
+        run: _PersistentRun[_ModelT],
+        stats: object,
+    ) -> None:
+        """Fold one consumed quantum's session stats into the run's telemetry."""
         run.quantum_count += 1
         run.stats.physical_steps += int(getattr(stats, "physical_steps", 0))
+        run.stats.wasted_token_rows += int(getattr(stats, "wasted_token_rows", 0))
         for width, steps in dict(getattr(stats, "active_steps_by_width", {})).items():
             run.stats.active_steps_by_width[int(width)] = run.stats.active_steps_by_width.get(
                 int(width), 0
             ) + int(steps)
+
+    def _publish_quantum_completions(
+        self,
+        run: _PersistentRun[_ModelT],
+        completed: list[tuple[object, object]],
+    ) -> None:
+        """Publish a consumed quantum's completions and checkpoints.
+
+        Shared by the decode action and `_drain_in_flight_quantum`, so a
+        completion drained ahead of a slot-mutating action follows exactly the
+        path a synchronous quantum's would."""
         for index, (item, result) in enumerate(completed):
             resident_handle = getattr(result, "resident_handle", None)
             if resident_handle is not None:
@@ -3381,11 +3448,28 @@ class ModelWorkerPool(Generic[_ModelT]):
                 result=completed_result,
                 source_item=prepared.session_item,
             )
-        return ActionResult(
-            ActionResultStatus.APPLIED,
-            selected_action,
-            state.version,
+
+    def _drain_in_flight_quantum(self, run: _PersistentRun[_ModelT]) -> None:
+        """Consume a run's in-flight replay before anything mutates its state.
+
+        Publishing goes through `_publish_quantum_completions`, so a drained
+        quantum is indistinguishable from a synchronous one downstream. No
+        launch here: drain sites are about to change slots, pages or arenas,
+        and the next decode dispatch relaunches on the new state."""
+        session = run.session
+        if session is None or not getattr(session, "quantum_in_flight", False):
+            return
+        completed: list[tuple[object, object]] = []
+        drain_started = time.perf_counter()
+        slots_before = self._waterfall_slots(run)
+        stats = session.consume_quantum(
+            lambda item, result: completed.append((item, result)),
+            checkpointed=lambda item, result: completed.append((item, result)),
         )
+        self._last_decode_quantum_finished_at = time.perf_counter()
+        self._accumulate_quantum_stats(run, stats)
+        self._record_waterfall_event(run, "decode", drain_started, slots_before)
+        self._publish_quantum_completions(run, completed)
 
     def _execute_condition_batch(
         self,
@@ -3871,6 +3955,9 @@ class ModelWorkerPool(Generic[_ModelT]):
                 else int(getattr(session, "remaining_decode_token_budget", 0))
             ),
             completed_quanta=run.quantum_count,
+            decode_launch_in_flight=bool(
+                getattr(session, "quantum_in_flight", False)
+            ),
             cancelled_pending=sum(
                 bool(
                     getattr(task, "future", None) is not None
@@ -5808,6 +5895,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             pipeline_session_id=task.pipeline_session_id,
             batch_size=run.width,
             generation_steps=run.stats.physical_steps if report_stats else 0,
+            wasted_token_rows=run.stats.wasted_token_rows if report_stats else 0,
             hot_replacements=run.stats.hot_replacements if report_stats else 0,
             resident_checkpoints=int(
                 getattr(result, "resident_handle", None) is not None

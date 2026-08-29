@@ -242,6 +242,9 @@ def write_scheduler_telemetry(
         "generated_tokens": sum(
             int(job.get("generated_token_count", 0)) for job in jobs
         ),
+        "wasted_token_rows": sum(
+            int(job.get("wasted_token_rows", 0)) for job in jobs
+        ),
         "jobs_by_batch_size": widths,
         "hot_replacements": sum(
             int(job.get("hot_replacements", 0)) for job in jobs

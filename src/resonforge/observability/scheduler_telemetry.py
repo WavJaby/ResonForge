@@ -16,7 +16,12 @@ CORE_TELEMETRY_FIELDS = (
 )
 
 TELEMETRY_CAPABILITY_FIELDS: dict[str, tuple[str, ...]] = {
-    "generation": ("generation_steps", "generated_token_count", "termination_reason"),
+    "generation": (
+        "generation_steps",
+        "wasted_token_rows",
+        "generated_token_count",
+        "termination_reason",
+    ),
     "persistent_sessions": (
         "hot_replacements",
         "resident_checkpoints",

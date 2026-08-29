@@ -78,6 +78,11 @@ class SchedulerRunState:
     admission_safe: bool
     capacity_ready: bool = True
     arena_admission_safe: bool = True
+    # S5c host-async decode: a replay was launched and its tokens are not yet
+    # consumed. In the decided signature so a launch-only decode dispatch and
+    # its later consume each move the version -- without this, launch-only is
+    # an APPLIED action that changes nothing and trips the progress contract.
+    decode_launch_in_flight: bool = False
     # Blocks this run may still claim from its device pool, already net of
     # every other holder's reservation and of the floors other declared lanes
     # keep. `None` means nothing bounds it: off CUDA, or an unpriced lane.
