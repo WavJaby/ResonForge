@@ -231,7 +231,7 @@ def parse_args() -> CliInvocation:
             "bucket; eager = issue it per admission). Two reasons this is a "
             "flag: a device may not support capture, and what it is worth is a "
             "property of the host -- 10.30 -> 4.63 ms at width 1 on BAIR's "
-            "fp16 cards, ~2% on a compute-6.1 fp32 card whose forward is "
+            "fp16 cards, ~2%% on a compute-6.1 fp32 card whose forward is "
             "already saturated. It carries no kernel choice; the prefill runs "
             "whichever attention backend --muscriptor-runtime selected"
         ),
