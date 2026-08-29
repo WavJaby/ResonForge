@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from .base import Transcriber
 
-DEFAULT_TRANSCRIBER = "mt3.yptf_moe_multi"
+DEFAULT_TRANSCRIBER = "muscriptor.small"
 TRANSCRIBABLE_STEMS = frozenset(
     {"bass", "drums", "guitar", "piano", "other", "vocals", "band"}
 )
@@ -18,14 +18,9 @@ def _load_backends() -> dict[str, Transcriber]:
     """Import backend adapters lazily to keep package imports acyclic."""
     global _BACKENDS
     if _BACKENDS is None:
-        from .basic_pitch.transcription import BACKEND as basic_pitch
-        from .mt3.transcription import BACKEND as mt3
         from .muscriptor.transcription import BACKEND as muscriptor
 
-        _BACKENDS = {
-            backend.name: backend
-            for backend in (basic_pitch, mt3, muscriptor)
-        }
+        _BACKENDS = {muscriptor.name: muscriptor}
     return _BACKENDS
 
 
