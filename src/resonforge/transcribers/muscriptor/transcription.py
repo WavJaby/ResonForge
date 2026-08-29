@@ -242,7 +242,7 @@ def _prepare_recovery_continuous_work(
     )
 
 
-# `MAX_ARENA_WIDTH = 20` and `MAX_SECONDARY_ARENA_WIDTH = 2` stood here, deleted with the condition they defended against (CLAUDE.md).
+# `MAX_ARENA_WIDTH = 20` and `MAX_SECONDARY_ARENA_WIDTH = 2` stood here, deleted with the condition they defended against.
 # Both were bands against "the lane that opens first takes the device" -- real and repeatedly reproduced: a lane opened wide, used a fraction, finished its burst in seconds and held the rest all run
 # while the co-resident lane sat on its floor of 1, roughly doubling the wall. Instances: docs/REPORT.md R11.
 # That condition holds only while a lane opens at *what fits*. It doesn't survive `_resolve_arena_width` asking `_run_demand_width` instead -- a lane now opens at the rows it has work for, so there's nothing for the first lane to take.

@@ -85,7 +85,7 @@ class SchedulerRunState:
     # Rows this lane's **page** supply can still fund. `None` means unpriced:
     # off CUDA, or a lane whose arenas are private.
     #
-    # The second conservation law (`CLAUDE.md`, R1), and until 2026-08-25 this
+    # The second conservation law -- pages, against the block pool's bytes -- and until 2026-08-25 this
     # layer did not have it. Device bytes were here from the start
     # (`pool_available_blocks`); pages were consulted only when a *session* was
     # opened, and `_nonresident_arena_admission_safe` returns True for anything
@@ -102,7 +102,7 @@ class SchedulerRunState:
     # P4. The width this lane has been told to hold, and the device blocks the
     # change claims -- signed, so a narrowing carries a negative. `None` means
     # no outstanding instruction. Two numbers because rows and blocks are
-    # separate conservation laws (`CLAUDE.md`, R1) and no rate converts one
+    # separate conservation laws and no rate converts one
     # lane's rows into another lane's bytes.
     resize_target_width: int | None = None
     resize_block_delta: int = 0

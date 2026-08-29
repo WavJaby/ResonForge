@@ -4,20 +4,36 @@ version = "0.1.0"
 description = "BS-RoFormer separation, MuScriptor transcription, and MIDI mixdown pipeline"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    "basic-pitch[onnx]==0.4.0",
     "bs-roformer-infer @ git+https://github.com/openmirlab/bs-roformer-infer@04cfa4be2d04ad5164c6f7e97ff31f37b0b162fe",
     "librosa>=0.11,<0.12",
     "mido==1.3.3",
     "mt3-infer[torch]==0.2.0",
     "muscriptor",
+    "numba==0.66.0",
     "numpy==2.4.6",
-    "resampy==0.4.3",
+    # Declared 2026-08-27, for the same reason as `yt-dlp` below and found the
+    # same way. `modules/cuda_contiguous_attention.py` JIT-builds the native
+    # attention kernel through `torch.utils.cpp_extension.load` at **runtime**,
+    # and that needs ninja. A host with a cached binary never notices; a fresh
+    # one raises `Ninja is required to load C++ extensions` from inside
+    # `backend.attend`, which reads as a kernel numerics failure and is an
+    # environment gap. Found on BAIR, where it failed the one test that
+    # compares the native kernel against the dense reference.
+    "ninja>=1.13",
+    "nvidia-ml-py==13.610.43",
     "setuptools<81",
     "soundfile==0.14.0",
     "torch==2.6.0+cu124",
     "torchaudio==2.6.0+cu124",
     "torchvision==0.21.0+cu124",
     "transformers==4.44.2",
+    # Declared 2026-08-27. `youtube/youtube_music_metadata.py` imports it
+    # lazily, so the package installs and the pipeline runs without it -- and
+    # then eight tests fail with `ModuleNotFoundError` on any host where it was
+    # never installed by hand. Found on BAIR, whose environment predates the
+    # module. A lazy import is not a reason to leave a runtime dependency
+    # undeclared; it only moves when the failure arrives.
+    "yt-dlp>=2026.07.04",
 ]
 
 [project.scripts]
@@ -47,7 +63,6 @@ environments = [
 ]
 cache-dir = ".uv-cache"
 exclude-dependencies = ["tensorflow", "tensorflow-macos"]
-override-dependencies = ["resampy==0.4.3"]
 
 [tool.pytest.ini_options]
 addopts = ["--basetemp=.pytest-tmp"]
@@ -67,4 +82,3 @@ muscriptor = { path = "third_party/muscriptor", editable = true }
 torch = { index = "pytorch-cu124" }
 torchaudio = { index = "pytorch-cu124" }
 torchvision = { index = "pytorch-cu124" }
-

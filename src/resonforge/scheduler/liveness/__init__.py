@@ -7,5 +7,5 @@ They are separate files and one obligation: the proof is only about the producti
 Since paging G, `_pool_admits` in the model is the same single comparison as `PoolView.admits`, which is what makes the device-byte half of S1 gated rather than argued.
 
 ! the model has NO page supply -- `ModelRunState` carries `arena_blocks` and a `resource_blocked` flag, so a state with free slots and zero pages cannot be expressed in it, let alone reached.
-  S1b in CLAUDE.md. A deadlock happened on that excluded law on 2026-08-26; treat any new admission, pause or bundle path as unproved against pages.
+  A deadlock happened on that excluded law on 2026-08-26; treat any new admission, pause or bundle path as unproved against pages.
 """

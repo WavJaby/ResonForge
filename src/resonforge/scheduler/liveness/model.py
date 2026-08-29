@@ -77,8 +77,7 @@ class ModelBundleState:
 class ModelResizeTarget:
     """One instruction to a lane: hold this many rows, at this arena cost.
 
-    Both numbers, because the two conservation laws are separate (project
-    `CLAUDE.md`, R1) and a width alone does not say what the arena costs --
+    Both numbers, because device bytes and KV pages are separate conservation laws and a width alone does not say what the arena costs --
     a `medium` row is 24 layers of 1,024-wide pages against 14 of 768, so no
     rate converts one lane's rows into another's blocks.
     """
@@ -250,8 +249,7 @@ def _pool_admits(state: ModelState, extra_blocks: int = 0) -> bool:
 
     Only a resident arena holds device blocks. A recovery bundle holds none:
     its members run inside an arena that already exists and draw **pages**,
-    which is the page pool's conservation law, not this one (project
-    `CLAUDE.md`, R1). With nothing declaring a future block demand there is no
+    which is the page pool's conservation law, not this one. With nothing declaring a future block demand there is no
     Need to fund, so there is no hold-and-wait on device bytes and no safe
     sequence to search for.
 
