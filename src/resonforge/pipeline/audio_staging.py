@@ -10,8 +10,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import librosa
+import numpy as np
 import soundfile as sf
 
+from ..runtime.process_runner import ProcessRunner
 from .paths import (
     BS_CHANNELS,
     BS_INPUT_ROOT,
@@ -19,7 +22,6 @@ from .paths import (
     DEFAULT_BS_SAMPLE_RATE,
     SERVICE_ROOT,
 )
-from .process_runner import ProcessRunner
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,12 +38,14 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def inspect_input(input_file: Path) -> tuple[Path, Path, str, str]:
+def inspect_input(
+    input_file: Path, output_root: Path | None = None
+) -> tuple[Path, Path, str, str]:
     source = input_file.expanduser().resolve()
     require_file(source, "Input audio file")
     input_hash = sha256_file(source)
     base_name = source.stem
-    output_dir = BS_OUTPUT_ROOT / base_name
+    output_dir = (output_root or BS_OUTPUT_ROOT).expanduser().resolve() / base_name
     output_dir.mkdir(parents=True, exist_ok=True)
     return source, output_dir, base_name, input_hash
 
@@ -90,11 +94,38 @@ def build_ffmpeg_staging_command(
     ]
 
 
+def convert_with_soundfile(
+    source: Path,
+    destination: Path,
+    *,
+    sample_rate: int,
+    channels: int = BS_CHANNELS,
+) -> None:
+    """Decode formats supported by libsndfile when ffmpeg is unavailable."""
+    audio, source_rate = sf.read(source, dtype="float32", always_2d=True)
+    if not audio.size:
+        raise ValueError(f"empty audio: {source}")
+    audio = np.nan_to_num(audio, copy=False)
+    if audio.shape[1] != channels:
+        mono = np.mean(audio, axis=1, dtype=np.float32)
+        audio = np.repeat(mono[:, None], channels, axis=1)
+    if source_rate != sample_rate:
+        audio = librosa.resample(
+            audio.T,
+            orig_sr=source_rate,
+            target_sr=sample_rate,
+            res_type="soxr_hq",
+            axis=-1,
+        ).T
+    sf.write(destination, audio, sample_rate, subtype="PCM_24")
+
+
 def stage_input(
     source: Path,
     input_hash: str,
     *,
     sample_rate: int = DEFAULT_BS_SAMPLE_RATE,
+    channels: int = BS_CHANNELS,
     runner: ProcessRunner | None = None,
     log_dir: Path | None = None,
 ) -> Path:
@@ -108,21 +139,35 @@ def stage_input(
     )
     staged = input_dir / f"{source.stem}.wav"
     try:
-        if input_matches_staging_format(source, sample_rate=sample_rate):
+        if input_matches_staging_format(
+            source, sample_rate=sample_rate, channels=channels
+        ):
             shutil.copy2(source, staged)
             LOGGER.info(f"Copied input: {source} -> {staged}")
             return input_dir
 
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg is None:
-            raise FileNotFoundError(
-                f"ffmpeg is required to convert {source.suffix or 'audio'} input to WAV"
-            )
+            try:
+                convert_with_soundfile(
+                    source,
+                    staged,
+                    sample_rate=sample_rate,
+                    channels=channels,
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise FileNotFoundError(
+                    f"ffmpeg is required to convert unsupported "
+                    f"{source.suffix or 'audio'} input to WAV"
+                ) from error
+            LOGGER.info("Decoded input with libsndfile: %s -> %s", source, staged)
+            return input_dir
         command = build_ffmpeg_staging_command(
             ffmpeg,
             source,
             staged,
             sample_rate=sample_rate,
+            channels=channels,
         )
         if runner is not None:
             return_code = runner.run(

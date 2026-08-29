@@ -12,7 +12,7 @@ import librosa
 import mido
 import numpy as np
 
-from ..audio_loading import load_mono_audio
+from ..audio.loading import load_mono_audio
 
 
 @dataclass

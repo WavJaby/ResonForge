@@ -8,6 +8,7 @@ from pathlib import Path
 
 import mido
 
+from .document import MidiDocument
 from .intervals import (
     Note,
     drop_chunk_notes,
@@ -41,6 +42,55 @@ class MidiConversionError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class MidiConversionResult:
+    document: MidiDocument
+    notes: tuple[Note, ...]
+    report: dict[str, object]
+
+
+def convert_events_to_midi(
+    events,
+    *,
+    rejected_chunks: set[int] | frozenset[int] = frozenset(),
+    maximum_note_seconds: float = 10.0,
+    cleanup: bool = False,
+    bpm: float = 120.0,
+    allow_empty: bool = False,
+) -> MidiConversionResult:
+    """Convert MuScriptor payloads without creating an intermediate file."""
+    notes = events_to_notes(events, allow_empty=allow_empty)
+    input_notes = len(notes)
+    chunk_report = drop_chunk_notes(notes, rejected_chunks)
+    notes = chunk_report.notes
+    if not notes and not allow_empty:
+        raise MidiConversionError("no notes remain after rejected chunks")
+    if cleanup:
+        interval_report = sanitize_note_intervals(
+            notes,
+            maximum_duration=maximum_note_seconds,
+        )
+        notes = interval_report.notes
+        duplicates = interval_report.near_duplicates_merged
+        overlaps = interval_report.overlaps_truncated
+        durations_clamped = interval_report.durations_clamped
+    else:
+        duplicates = overlaps = durations_clamped = 0
+    return MidiConversionResult(
+        document=notes_to_midi_document(notes, bpm=bpm),
+        notes=tuple(notes),
+        report={
+            "input_notes": input_notes,
+            "output_notes": len(notes),
+            "missing_eos_chunks": sorted(rejected_chunks),
+            "missing_eos_removed": chunk_report.notes_removed,
+            "near_duplicates_merged": duplicates,
+            "overlaps_truncated": overlaps,
+            "durations_clamped": durations_clamped,
+        },
+    )
+
+
+@dataclass(frozen=True)
 class MidiConversionConfig:
     jsonl: Path
     out: Path | None = None
@@ -55,26 +105,32 @@ class MidiConversionConfig:
 
 
 def load_notes(path: Path) -> list[Note]:
+    return events_to_notes(
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+
+
+def events_to_notes(events, *, allow_empty: bool = False) -> list[Note]:
+    """Resolve MuScriptor event payloads into note intervals in memory."""
     starts: dict[int, dict] = {}
     notes: list[Note] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        ev = json.loads(line)
+    for ev in events:
         if ev["type"] == "start":
             starts[ev["index"]] = ev
         elif ev["type"] == "end":
             # CLI: index reference; Python API: nested start event.
             s = ev.get("start_event") or starts.get(ev.get("start_event_index"))
             if s is None:
-                raise ValueError(f"end without start: {line}")
+                raise ValueError(f"end without start: {ev}")
             notes.append((s["instrument"], s["pitch"], s["start_time"], ev["end_time"]))
-    if not notes:
+    if not notes and not allow_empty:
         raise MidiConversionError("no notes in jsonl")
     return notes
 
 
-def to_midi(notes, out: Path, bpm=120.0):
+def notes_to_midi_document(notes, bpm=120.0) -> MidiDocument:
     spb = 60.0 / bpm
     instruments = sorted({n[0] for n in notes})
     unknown = [i for i in instruments if i not in GM and i not in DRUMS]
@@ -118,8 +174,13 @@ def to_midi(notes, out: Path, bpm=120.0):
                 trk.append(mido.Message("note_on", channel=ch, note=p, velocity=90, time=dt))
             else:
                 trk.append(mido.Message("note_off", channel=ch, note=p, velocity=0, time=dt))
-    mid.save(out)
-    return instruments
+    return MidiDocument.from_mido(mid)
+
+
+def to_midi(notes, out: Path, bpm=120.0):
+    document = notes_to_midi_document(notes, bpm=bpm)
+    document.write(out)
+    return sorted({note[0] for note in notes})
 
 
 def rewrite_midi_program(

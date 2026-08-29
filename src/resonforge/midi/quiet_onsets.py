@@ -7,7 +7,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 
-from ..audio_loading import load_mono_audio
+from ..audio.loading import load_mono_audio
 from .cleanup import _save_without_boundaries, read_midi_notes
 
 

@@ -1,14 +1,18 @@
-"""Final MIDI merge and optional MP3 mixdown phase."""
+"""Memory-first final MIDI merge and optional output publication."""
 
 from __future__ import annotations
 
 import logging
+import tempfile
 from pathlib import Path
 
-from ..midi.mixdown import merge_midis, mixdown_midis
-from .audio_staging import require_file
+from resonforge.transcribers.base import StemTask
+
+from ..midi.merge import merge_midi_documents
+from ..midi.mixdown import mixdown_midis
+from .memory_postprocessing import PostprocessBatchResult
 from .muscriptor_tempo import merged_bpm
-from .types import PipelineContext, PipelineOutputs, StemTask
+from .types import InitializedRun, PipelineOutputs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,78 +28,61 @@ STEM_GAINS_DB = {
 
 
 def produce_outputs(
-    midi_paths: dict[str, Path],
+    batch: PostprocessBatchResult,
     tasks: list[StemTask],
     *,
-    context: PipelineContext,
+    run: InitializedRun,
 ) -> PipelineOutputs:
-    """Merge selected stems and optionally render the MP3 mixdown."""
-    config = context.config
-    if context.output_dir is None:
-        raise RuntimeError("pipeline context has not been initialized")
-
-    midi_files = [midi_paths[task.name] for task in tasks]
-    for midi_file in midi_files:
-        require_file(midi_file, "MIDI for mixdown")
-    merged = context.output_dir / f"{context.run_prefix}-final.mid"
-    output_bpm = merged_bpm(context.tempo_result)
-    LOGGER.info("\n== Merging final MIDI (velocities unchanged) ==")
-    output_beats_per_bar = (
-        context.tempo_result.get("beats_per_bar")
-        if context.tempo_result is not None
-        else None
-    )
-    bar_phase_seconds = (
-        context.tempo_result.get("bar_phase_seconds")
-        if context.tempo_result is not None
-        else None
-    )
+    """Merge MIDI in memory and publish only when the output sink is enabled."""
+    documents = [batch.stems[task.name].selected_midi for task in tasks]
+    output_bpm = merged_bpm(batch.tempo)
+    meter = batch.tempo.get("beats_per_bar") if batch.tempo else None
+    phase = batch.tempo.get("bar_phase_seconds") if batch.tempo else None
+    kwargs = {
+        "source_gains_db": [0.0] * len(documents),
+        "output_bpm": output_bpm,
+        "track_names": [task.name for task in tasks],
+        "output_beats_per_bar": meter,
+        "bar_phase_seconds": phase,
+    }
     try:
-        midi_mode = merge_midis(
-            midi_files,
-            merged,
-            [0.0] * len(midi_files),
-            normalize_velocity=None,
-            output_bpm=output_bpm,
-            track_names=[task.name for task in tasks],
-            output_beats_per_bar=output_beats_per_bar,
-            bar_phase_seconds=bar_phase_seconds,
-        )
+        merged, mode = merge_midi_documents(documents, **kwargs)
     except ValueError:
-        midi_mode = merge_midis(
-            midi_files,
-            merged,
-            [0.0] * len(midi_files),
-            normalize_velocity=None,
-            use_ports=True,
-            output_bpm=output_bpm,
-            track_names=[task.name for task in tasks],
-            output_beats_per_bar=output_beats_per_bar,
-            bar_phase_seconds=bar_phase_seconds,
-        )
-    LOGGER.info(
-        f"  merged MIDI -> {merged} ({midi_mode}, {output_bpm:.3f} BPM)",
-    )
-    context.metadata["outputs"]["final_midi"] = str(merged)
-    context.metadata["outputs"]["final_midi_bpm"] = output_bpm
-    context.metadata["outputs"]["final_midi_beats_per_bar"] = output_beats_per_bar
-    context.metadata["outputs"]["final_midi_bar_phase_seconds"] = bar_phase_seconds
+        merged, mode = merge_midi_documents(documents, use_ports=True, **kwargs)
 
-    mix_path = None
-    if config.mp3_out:
-        mix_path = context.output_dir / f"{context.run_prefix}-final.mp3"
-        LOGGER.info("\n== Rendering MIDI mixdown to MP3 ==")
-        mixdown_midis(
-            midi_files,
-            out=mix_path,
-            mp3_bitrate=config.mp3_bitrate,
-            jobs=config.mix_jobs,
-            track_gains_db=",".join(
-                str(STEM_GAINS_DB[task.name]) for task in tasks
-            ),
-            normalize_dbfs=-1.0,
-            midi_normalize_velocity=110,
-            midi_out=None,
-        )
-        context.metadata["outputs"]["final_mp3"] = str(mix_path)
-    return PipelineOutputs(midi=merged, mp3=mix_path)
+    midi_path = None
+    mp3_path = None
+    if run.config.publish_files:
+        midi_path = merged.write(run.output_dir / "final.mid")
+        run.metadata["outputs"]["final_midi"] = str(midi_path)
+        if run.config.mp3_out:
+            mp3_path = run.output_dir / "final.mp3"
+            with tempfile.TemporaryDirectory(prefix="resonforge-mix-") as directory:
+                sources = []
+                for task, document in zip(tasks, documents, strict=True):
+                    source = Path(directory) / f"{task.name}.mid"
+                    document.write(source)
+                    sources.append(source)
+                mixdown_midis(
+                    sources,
+                    out=mp3_path,
+                    mp3_bitrate=run.config.mp3_bitrate,
+                    jobs=run.config.mix_jobs,
+                    track_gains_db=",".join(
+                        str(STEM_GAINS_DB[task.name]) for task in tasks
+                    ),
+                    normalize_dbfs=-1.0,
+                    midi_normalize_velocity=110,
+                    midi_out=None,
+                )
+            run.metadata["outputs"]["final_mp3"] = str(mp3_path)
+    run.metadata["outputs"].update(
+        {
+            "final_midi_bpm": output_bpm,
+            "final_midi_beats_per_bar": meter,
+            "final_midi_bar_phase_seconds": phase,
+            "midi_mode": mode,
+            "published": run.config.publish_files,
+        }
+    )
+    return PipelineOutputs(merged, midi_path, mp3_path)

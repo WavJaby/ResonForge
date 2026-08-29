@@ -17,10 +17,14 @@ def venv_executable(venv: Path, command: str) -> Path:
 
 
 PYTHON = Path(sys.executable)
-BASIC_PITCH_PROJECT = SERVICE_ROOT / "environments" / "basic-pitch"
-BASIC_PITCH = venv_executable(BASIC_PITCH_PROJECT / ".venv", "basic-pitch")
 BS_INPUT_ROOT = SERVICE_ROOT / "input"
 BS_OUTPUT_ROOT = SERVICE_ROOT / "output"
+# Separated stems are content-addressed by (input hash, sample rate), so they
+# belong to the input, not to any one run's output tree. Keeping them here
+# rather than under the run's output root is what lets `--output-root` give
+# each experiment its own directory without re-separating the same audio for
+# every arm — separation is the pipeline's most expensive per-song fixed cost.
+BS_CACHE_ROOT = SERVICE_ROOT / "output" / ".separation-cache"
 MODELS_ROOT = SERVICE_ROOT / "models"
 BS_MODEL_DIR = (
     MODELS_ROOT / "bs-roformer" / "roformer-model-bs-roformer-sw-by-jarredou"

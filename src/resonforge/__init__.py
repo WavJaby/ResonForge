@@ -9,28 +9,24 @@ from __future__ import annotations
 from importlib import import_module
 
 _EXPORTS = {
-    "GATE_PRESETS": (".adaptive_volume_gate", "GATE_PRESETS"),
-    "GatePreset": (".adaptive_volume_gate", "GatePreset"),
-    "GateResult": (".adaptive_volume_gate", "GateResult"),
-    "adaptive_volume_gate": (".adaptive_volume_gate", "adaptive_volume_gate"),
-    "get_gate_preset": (".adaptive_volume_gate", "get_gate_preset"),
+    "GATE_PRESETS": (".audio.adaptive_volume_gate", "GATE_PRESETS"),
+    "GatePreset": (".audio.adaptive_volume_gate", "GatePreset"),
+    "GateResult": (".audio.adaptive_volume_gate", "GateResult"),
+    "adaptive_volume_gate": (".audio.adaptive_volume_gate", "adaptive_volume_gate"),
+    "get_gate_preset": (".audio.adaptive_volume_gate", "get_gate_preset"),
     "hard_zero_audio_blocks": (
-        ".adaptive_volume_gate",
+        ".audio.adaptive_volume_gate",
         "hard_zero_audio_blocks",
     ),
     "analyze_stem_presence": (
-        ".stem_presence_filter",
+        ".audio.stem_presence_filter",
         "analyze_stem_presence",
     ),
     "assess_stem_presence": (
-        ".stem_presence_filter",
+        ".audio.stem_presence_filter",
         "assess_stem_presence",
     ),
     "convert_jsonl_to_midi": (".midi.jsonl", "convert_jsonl_to_midi"),
-    "export_general_midi": (
-        ".transcribers.basic_pitch.general",
-        "export_general_midi",
-    ),
     "mixdown_midis": (".midi.mixdown", "mixdown_midis"),
     "run_pipeline": (".pipeline", "run_pipeline"),
 }

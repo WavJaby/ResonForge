@@ -6,9 +6,11 @@ import math
 from collections import Counter
 from statistics import median
 
-from ..tempo_types import MuscriptorTempoReport, TempoResult
+from resonforge.transcribers.base import StemTask
+
+from ..observability.tempo_types import MuscriptorTempoReport, TempoResult
 from .transcription import split_transcriber_spec, transcriber_for_stem
-from .types import PipelineContext, StemTask
+from .types import PipelineContext
 
 
 def _finite_float(
@@ -35,16 +37,22 @@ def analyze_muscriptor_tempo(
         "model": model or "default",
         "status": "failed",
     }
-    if not task.audio.is_file():
+    if task.buffer is None and not task.audio.is_file():
         report["reason"] = "missing_audio_file"
         return report
 
     try:
+        import torch
         from muscriptor.utils.audio import load_audio
         from muscriptor.utils.beats import BeatDetectionError, detect_grid
 
-        wav = load_audio(task.audio, target_sr=16_000)
-        beat_grid = detect_grid(wav, 16_000, checkpoint="final0")
+        if task.buffer is None:
+            wav = load_audio(task.audio, target_sr=16_000)
+            sample_rate = 16_000
+        else:
+            wav = torch.from_numpy(task.buffer.samples.T.copy())
+            sample_rate = task.buffer.sample_rate
+        beat_grid = detect_grid(wav, sample_rate, checkpoint="final0")
     except FileNotFoundError:
         report["reason"] = "audio_file_not_found"
         return report
