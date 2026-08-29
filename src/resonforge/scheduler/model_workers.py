@@ -75,7 +75,7 @@ _LOGGER = logging.getLogger(__name__)
 _DECLARATION_POLL_SECONDS = 1.0
 # `RESONFORGE_EXPERIMENT_SPILL` is gone with the allocation that justified it: freeing an arena slot used to mean *allocating* a second GPU copy of the paused row.
 # Since A3 preemption frees the same slot -- pages go back to the supply, the row is rebuilt bit-identical by re-running what wrote its KV.
-# Allocates nothing => nothing left to trade. Figures: docs/paging/PLAN.md.
+# Allocates nothing => nothing left to trade.
 
 
 @dataclass(frozen=True)
@@ -126,6 +126,18 @@ class SchedulerLivenessError(RuntimeError):
         self.report = report
 
 
+class DeviceCannotHoldOneRow(SchedulerInvariantError):
+    """A lane's WHOLE page supply funds zero rows: total below its own row floor with nothing lent.
+
+    Terminal by arithmetic, not by load: no release can raise free above total, so `_pages_admit`'s
+    assumption ("a lane refused here always has a running row whose completion clears the refusal")
+    is false and every later dispatch grinds to `enabled_actions == [fail]` with nothing resident --
+    deadlock capture C, 2026-08-28. Named here rather than in the pool because the pool reports
+    and the banker enforces (`row_floor_blocks` docstring). Delete when supply declaration is gated
+    to never open below the floor.
+    """
+
+
 def resident_handle_key(handle: object) -> tuple[int, int, int]:
     """Identify a resident KV row by value, not by object identity.
 
@@ -148,10 +160,25 @@ def _kv_row_capacity(device: str, lane: str) -> int:
     Imported here, not at module scope -- this scheduler is generic over the model it drives, and page geometry is the model's business.
     """
     try:
-        from muscriptor.modules.paged_kv import declared_pool_row_capacity
+        from muscriptor.modules.paged_kv import (
+            declared_pool_bytes,
+            declared_pool_free_bytes,
+            declared_pool_row_capacity,
+            lane_row_bytes,
+        )
     except ImportError:
         return -1
-    return declared_pool_row_capacity(device, lane)
+    rows = declared_pool_row_capacity(device, lane)
+    # 0 with pages lent is ordinary exhaustion: rows end, pages return, the refusal clears.
+    # 0 with the supply WHOLE can never clear -- raise it by name instead of reporting a
+    # refusal `_pages_admit` will wait on forever (deadlock capture C).
+    if rows == 0 and declared_pool_free_bytes(device, lane) == declared_pool_bytes(device, lane):
+        raise DeviceCannotHoldOneRow(
+            f"lane {lane!r} on {device}: whole KV supply of "
+            f"{declared_pool_bytes(device, lane)} bytes cannot fund one row of "
+            f"{lane_row_bytes(device, lane)} bytes"
+        )
+    return rows
 
 
 def _kv_fundable_rows(
@@ -162,7 +189,7 @@ def _kv_fundable_rows(
 ) -> int:
     """Rows this lane's KV **could** be funded for, not what its pool holds.
 
-    Different questions, and conflating them made the first declaration final (docs/REPORT.md R12).
+    Different questions, and conflating them made the first declaration final (R12).
     A pool is sized from the width the arena opened at; reading that back as the affordable width means the opening width can never be exceeded, so no resize is selected and the pool is never re-declared
     -- a fixed point where the device could fund thousands of rows and the page pool answered 1.
 
@@ -577,7 +604,7 @@ class _PersistentRun(Generic[_ModelT]):
     width_funded_ceiling: int = 0
     # Reset at each RESIZE to the queue standing then, and nowhere else.
     # Resetting when the lane goes owner-free sounds equivalent (both are phase boundaries) and isn't: owner-free is when the lane just finished everything, so it reads the trough,
-    # and the peak this exists to remember is gone before anything can act on it. Measured, docs/REPORT.md R12.
+    # and the peak this exists to remember is gone before anything can act on it. Measured (R12).
     demand_high_water: int = 0
     # resolved once at capacity preparation, by asking the loaded model
     arena_cost: ArenaCost | None = None
@@ -690,7 +717,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         # Intents from threads that are not the scheduler worker. They are
         # applied at exactly one point in the turn (`_drain_intents`), which is
         # what lets a decided-version difference across an action have only one
-        # possible cause. See `docs/occupancy/SINGLE_WRITER.md`.
+        # possible cause (the single-writer rule).
         self._intent_lock = threading.Lock()
         self._pending_intents: list[tuple[str, Callable[[], None]]] = []
         self._applied_intents = 0
@@ -952,7 +979,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         bundle_future: Future[tuple[object, ...]] = Future()
         # Argument validation above stays on the calling thread. Everything
         # below reads and writes decided state, so the worker applies it --
-        # `docs/occupancy/SINGLE_WRITER.md`. The caller already waits on
+        # the single-writer rule. The caller already waits on
         # `bundle_future`, which is where a violation now surfaces.
         self._enqueue_intent(
             "submit_batch_group",
@@ -1192,8 +1219,8 @@ class ModelWorkerPool(Generic[_ModelT]):
         callback_token = next(self._producer_binding_sequence)
         delivery_future: Future[object] = Future()
         # Everything above is an argument check and stays here. Everything below
-        # reads and writes decided state, so the worker applies it -- see
-        # `docs/occupancy/SINGLE_WRITER.md`. The caller gets `delivery_future`
+        # reads and writes decided state, so the worker applies it -- the
+        # single-writer rule. The caller gets `delivery_future`
         # immediately and waits on that, exactly as before.
         self._enqueue_intent(
             "bind_producer_decision_waits",
@@ -1352,7 +1379,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 result = future.result()
         # Inspecting the future is a read and stays on the callback thread.
         # Everything below moves decided state, so the worker applies it --
-        # `docs/occupancy/SINGLE_WRITER.md`. The delivery future is resolved
+        # the single-writer rule. The delivery future is resolved
         # inside the intent, after the mutation, which is what keeps a consumer
         # that waits on it from observing the state from before.
         self._enqueue_intent(
@@ -2228,7 +2255,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 # True only while decided state is single-writer. If this fires
                 # again, something mutates it outside the worker's drain -- the
                 # last intent name is the first place to look, not this call
-                # site. See `docs/occupancy/SINGLE_WRITER.md`.
+                # site (the single-writer rule).
                 raise RuntimeError(
                     "changed state cannot reject a stale action "
                     f"(observed={result.observed_version} "
@@ -3144,7 +3171,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             # workload that is not waiting on the device. A wider quantum also
             # overshoots, stepping rows a narrower boundary would have stopped;
             # that reading is *unconfirmed* because `wasted_token_rows` never
-            # reaches metadata. Numbers: `docs/scheduler-fill/README.md`.
+            # reaches metadata (scheduler-fill arms).
 
             quantum_steps = 4
             run.stats.quantum_steps_by_size[quantum_steps] = (
@@ -3646,7 +3673,7 @@ class ModelWorkerPool(Generic[_ModelT]):
     def _dispatch_readiness(self, run: _PersistentRun[_ModelT]) -> dict[str, int]:
         """Width and readiness at ONE instant, sampled at quantum dispatch.
 
-        S0 of docs/scheduler-fill/. The sibling `*_ready_width` fields on the same span are sampled when the action *ends*,
+        Scheduler-fill S0. The sibling `*_ready_width` fields on the same span are sampled when the action *ends*,
         so "decode ran narrow while rows were ready" is a comparison across two sampling points until something carries both.
 
         What the four numbers separate, which no pair of them can alone:
@@ -4295,7 +4322,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             return run.width
         # Never below the width already held. A narrowing returns the arena bytes and nothing else -- the KV supply, most of a row, is left alone because re-declaring it calls `torch.cuda.empty_cache()`.
         # So it trades negligible bytes against the ability to grow, and growth needs an empty slot set a busy lane doesn't reach.
-        # Measured: a lane narrowed 34 -> 1 at t=4s, wanted 2 rows at t=7s, couldn't have them for the remaining 18s. Worth doing again only when narrowing re-declares the supply. docs/REPORT.md.
+        # Measured: a lane narrowed 34 -> 1 at t=4s, wanted 2 rows at t=7s, couldn't have them for the remaining 18s. Worth doing again only when narrowing re-declares the supply.
         return max(run.width, target)
 
     def _effective_cost(self, run: _PersistentRun[_ModelT]) -> ArenaCost | None:
@@ -4309,7 +4336,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         if cost is None:
             return None
         # Plus the transient this row will cause. Not an allocation the arena makes, which is why it was never here -- it's the peak a decode step reaches above steady state, and it scales with declared rows.
-        # Charging it to the width is the only way a width is chosen against the memory it will actually need, not against a water line measured narrower that then rises behind the commitment. docs/REPORT.md R13.
+        # Charging it to the width is the only way a width is chosen against the memory it will actually need, not against a water line measured narrower that then rises behind the commitment (R13).
         # MARGINAL figure, because this prices a row about to be added: a slope between two measured widths, never a total / rows.
         # The total has a fixed term, so dividing overstates one more row most at narrow widths -- exactly where a lane is deciding whether it may grow.
         row_bytes = (
@@ -4755,7 +4782,7 @@ class ModelWorkerPool(Generic[_ModelT]):
     ) -> int:
         """The width this lane opens at: the same rule a resize would apply.
 
-        One rule, both moments. Opening at "the largest whole number of rows the free blocks cover" starves the second lane once ceilings come off (docs/REPORT.md R11)
+        One rule, both moments. Opening at "the largest whole number of rows the free blocks cover" starves the second lane once ceilings come off (R11)
         -- whoever opens first takes the device and never gives it back.
         A lane opens at the width it has work for, bounded by what the device can give -- exactly what `_run_demand_width` answers for a live lane.
 
@@ -4833,7 +4860,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             # back as the affordable width, the target can never exceed it, no
             # resize is selected, and the pool is never re-declared. Reached in
             # production, with the device able to fund thousands of rows and
-            # the pool answering **1** (`docs/REPORT.md` R12).
+            # the pool answering **1** (R12).
             funded = self._declare_kv_rows(run, model, run.width)
             if funded is not None and funded >= 1:
                 run.width = min(run.width, funded)
@@ -4860,7 +4887,7 @@ class ModelWorkerPool(Generic[_ModelT]):
 
         The supply is asked for the lane's **demand**, never for the width it
         happens to hold: sizing it from the width is what made the first
-        declaration final (`docs/REPORT.md`, R12).
+        declaration final (R12).
         """
         declare = run.kv_pool_declaration
         if declare is None:
@@ -5022,7 +5049,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         # Recovery and control outrank a plain decode; removing that was tried and reverted.
         # The suspicion was that a nearly-empty recovery lane preempts a full primary one. It does -- and removing the tier widened recovery's batches without buying any wall,
         # because you can't batch what doesn't arrive together: a second recovery row has to come from another song, at an unrelated moment.
-        # What it did buy was longer dependency latency, which is what this tier prevents. docs/scheduler-fill/README.md.
+        # What it did buy was longer dependency latency, which is what this tier prevents (scheduler-fill arms).
         if self._run_job_types(run) & {"recovery", "control"}:
             return 2, 0
         if action == "decode":
@@ -5268,7 +5295,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         # It works on the lane it targets (35% wider, 20% faster) and the co-resident lane loses exactly what that one gains, because the device is one serial resource.
         # Widening a lane redistributes throughput, it doesn't create it.
         # A penalty also only *ranks*: when the narrow action is the only candidate it still wins, and it usually is.
-        # Waiting would need an action kind meaning "none of these", which `SchedulerActionKind` doesn't have -- no enabled action raises. Conservation table + arms: docs/scheduler-fill/README.md.
+        # Waiting would need an action kind meaning "none of these", which `SchedulerActionKind` doesn't have -- no enabled action raises (scheduler-fill arms).
         return (
             *dependency_tier,
             0 if starvation_bound_reached else 1,
@@ -6389,7 +6416,7 @@ class ModelWorkerRegistry(Generic[_ModelT]):
 
         Every submitter parks here, on a future resolved by a preload done-callback rather than any scheduler action.
         That puts the wait outside the liveness model entirely -- no legal action missing, no run unresolved, nothing for the watchdog to fire on
-        -- so a lost resolution once held a device at 0% until it was killed, and wrote no run metadata (docs/REPORT.md R7).
+        -- so a lost resolution once held a device at 0% until it was killed, and wrote no run metadata (R7).
 
         Resolution finishing without publishing an outcome is not slowness, it's a contradiction, and reporting beats sleeping on it.
         Waiting stays unbounded while resolution has NOT finished: that time is a model load owned by the worker's own watchdog.
