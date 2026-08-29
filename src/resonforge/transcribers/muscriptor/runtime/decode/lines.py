@@ -34,6 +34,7 @@ from typing import Protocol
 
 import torch
 from muscriptor.generation_batch import GenerationRequest, GenerationResult
+from muscriptor.modules.cuda_contiguous_attention import check_block_table_fault
 from muscriptor.modules.streaming import increment_state_rows, select_state_rows
 
 #: Quanta a captured decode graph is built for, mirrored from the session so a
@@ -197,6 +198,10 @@ class EagerLine:
             host_rows=state_rows_host,
         )
         next_tokens_host = next_tokens.tolist()
+        # Drained by the read above, so a 4-byte flag check. Covers the
+        # cuda-eager line's kernel calls; a dense backend never allocates the
+        # flag and the check is a dict miss.
+        check_block_table_fault(session.device)
         for compact_index, index in enumerate(active):
             row = session.slots[index].row
             assert row is not None

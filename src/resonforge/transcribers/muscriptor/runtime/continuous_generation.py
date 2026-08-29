@@ -15,6 +15,7 @@ from muscriptor.generation_batch import GenerationRequest, GenerationResult
 from muscriptor.generation_guard import (
     GuardFinding,
 )
+from muscriptor.modules.cuda_contiguous_attention import check_block_table_fault
 from muscriptor.modules.paged_kv import (
     KVPagesExhausted,
     blocks_for_tokens,
@@ -145,7 +146,7 @@ class _PreemptedGeneration:
     Distinct from the spill it replaced, which MOVED a row's KV somewhere it still occupied memory -- now deleted outright, store and all, because nothing had written to it since A3.
     A preempted row keeps only what can't be recomputed: emitted tokens plus the sampling and grammar state saying where in its generation it was. Pages go back to the arena.
 
-    Not bit-exact, deliberately -- docs/paging/PLAN.md A3-3d. A decoded KV is written one token at a time by the Tq=1 kernel, a re-prefilled one in a single dense pass; they differ ~1e-4 relative.
+    Not bit-exact, deliberately (A3-3d). A decoded KV is written one token at a time by the Tq=1 kernel, a re-prefilled one in a single dense pass; they differ ~1e-4 relative.
     Greedy decoding tolerates that. Nothing here promises token identity the way `resume` does.
     """
 
@@ -858,16 +859,15 @@ class ContinuousGenerationBatch:
         prompt_length = len(row.request.prompt_ids)
         if len(row.tokens) <= prompt_length:
             raise ValueError("a row with no generated tokens has nothing to rebuild")
-        # KNOWN DEFECT, not fixed. This re-encodes conditions in a batch of one. A batched encode pads `instrument_group` to the batch max, so encoding the same request alone yields a SHORTER prepend
-        # -- shape difference only, values identical where the shapes are. `prepend_length` drives `sequence_length` and `increment_steps`, so the rebuilt row sits at a different position offset than the one it replaces.
-        # Reusing `row.conditions` is NOT the fix and was tried: `release_prefill` sets `self.conditions = {}` and `install` calls it, so by the time a row can be preempted its conditions are gone.
-        # The fix needs the original prepend retained deliberately -- tensors kept past `release_prefill`, or the length recorded and reproduced (docs/REPORT.md R10).
+        # This re-encodes conditions in a batch of one. It used to be R10's known defect: a batched encode padded `instrument_group` to the batch max, so the lone re-encode yielded a SHORTER prepend and the rebuilt row sat at a different offset.
+        # Fixed 2026-08-29 at the conditioner: `ClassConditioner.minimum_length` floors every encode at the group vocabulary, so alone and batched produce the same prepend length by construction.
+        # (Reusing `row.conditions` was NOT a fix and was tried: `release_prefill` clears them before a row can be preempted.)
         rebuilt = prepare_generation_row(
             self.lm, row.request, phase_recorder=self._phase_recorder
         )
         if rebuilt.last_token != row.tokens[prompt_length]:
             # Counted, not fatal. This used to raise, reasoning that a prefill is deterministic in its own inputs. It isn't, across WIDTH: a row prefilled as one of N shares one state and the rebuild prefills it alone, so the reductions differ.
-            # With only width moving, the KV diverges at the shortest prompts and is exactly zero by prompt 32 -- orders below what killed prompt-replay in A3-3d, and production divergences were all in the short range (docs/REPORT.md R10).
+            # With only width moving, the KV diverges at the shortest prompts and is exactly zero by prompt 32 -- orders below what killed prompt-replay in A3-3d, and production divergences were all in the short range (R10).
             # And the token it compares is DISCARDED: `self.sequence` below is loaded with the row's own token whatever the rebuild sampled, so this was always a proxy for KV equality, not a correctness gate.
             # Real quantity is restored KV vs live KV, gated by `test_a_row_prefilled_beside_another_survives_preemption`.
             self._preemptions["rebuild_token_divergences"] += 1
@@ -1533,8 +1533,8 @@ class ContinuousGenerationBatch:
         * `preemption_wait_quanta` -- turns of everyone else's work that passed while a row was absent. The starvation bound nothing currently proves.
         * `preemption_refusals` -- times this session held no page to give, so the shortage went back to the caller as real exhaustion
         * `rebuild_token_divergences` -- rebuilds whose own prefill sampled a different token than the row originally produced.
-          Expected small and non-zero: a row prefilled beside others is rebuilt alone and the reductions differ at fp16 scale.
-          Watch its RATE, not its presence -- it used to be fatal, and it's the only signal the two prefills disagreed at all (docs/REPORT.md R10).
+          Since the fixed condition padding (2026-08-29) the prepend no longer shifts on a lone rebuild, so only fp16 width-reduction differences remain
+          and this should sit at or near zero. A sustained non-zero rate is a signal again -- it used to be fatal (R10).
 
         Drained, not read: `scheduler_observations` are summed across jobs, so an absolute total gets multiplied by however many jobs looked.
         A monotone counter read as a before/after delta says the same only where the reader brackets EVERY producer -- and preemption's largest producer is the admission path, not decode.
@@ -1804,6 +1804,10 @@ class ContinuousGenerationBatch:
     ) -> tuple[int, int, dict[int, int]]:
         """Apply one graph block, retaining suffixes past checkpoints."""
         token_rows = graph_tokens.detach().cpu().tolist()
+        # The stream just drained for the tokens, so this is a 4-byte read, and
+        # it is the only place a *replayed* kernel's block-table fault can
+        # surface -- replay never re-enters the Python wrapper.
+        check_block_table_fault(self.device)
         # Margins the capture computed on device, one per step per row. Read
         # once here rather than per row: this is a device-to-host copy, and the
         # per-step `.item()` calls it replaces were two syncs per step.
