@@ -537,6 +537,12 @@ def main() -> int:
                 f"run {result.session_id} failed: {result.error}",
                 file=sys.stderr,
             )
+            # A failure that escaped _run_pipeline's own handler (e.g. from
+            # its finally) is recorded nowhere else -- the run's log already
+            # closed. This is its only surface; keep it.
+            trace = getattr(result.failure, "traceback_text", "")
+            if trace:
+                print(trace, file=sys.stderr)
     batch_performance = aggregate_performance(
         (result.performance for result in results),
         wall_seconds=time.monotonic() - started,

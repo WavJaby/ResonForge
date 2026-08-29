@@ -2905,7 +2905,9 @@ class ModelWorkerPool(Generic[_ModelT]):
             # decode consumes its own run's inline. A no-op while nothing is
             # in flight, which is always the case with async decode off.
             if action != "decode":
-                for candidate in runs_by_id.values():
+                # Over a copy: publishing a drained completion can submit
+                # follow-up work and create a run in the live dict mid-loop.
+                for candidate in list(runs_by_id.values()):
                     self._drain_in_flight_quantum(candidate)
             if action == "release_admit":
                 action_adapter_started = time.perf_counter()
