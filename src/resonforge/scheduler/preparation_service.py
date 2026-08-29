@@ -197,7 +197,7 @@ def _default_background_workers() -> int:
     **Widening it drains that queue and buys nothing**, because the analyses
     themselves then run **2.2x slower** -- they compete with the critical
     preparation lane and the model workers for the same cores. Wall clock is
-    identical. Arms: `docs/scheduler-fill/README.md`.
+    identical (scheduler-fill arms).
 
     **The queue is not on the critical path**: the four stems that start
     immediately keep the device fed while piano waits, so piano starting sooner
@@ -233,7 +233,7 @@ def _default_critical_workers() -> int:
     setting anything has been measured at, and the background lane above shows
     what oversubscription costs when it does bite. The override stays because
     the bound is host-dependent -- re-price it on the next host rather than
-    re-deriving the experiment. Arms and numbers: `docs/scheduler-fill/`.
+    re-deriving the experiment (scheduler-fill arms).
     """
     override = os.environ.get(CRITICAL_WORKERS_VARIABLE)
     if override:

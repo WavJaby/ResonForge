@@ -11,7 +11,7 @@ Computable vs calibrated:
   * the FORWARD is not, and splits in two: a fixed working set moving with neither rows nor length, and a per-row cost proportional to length. Both are the coefficients below.
 
 ! Fit against rows at ONE length and the answer is ~4x too small -- that form reads as a constant per row and isn't one, and it under-reserves exactly at production sequence length.
-  Two lengths are the minimum: one can't separate a constant from a rate, and three tidy points at a single length produced a confident 4x error. Points and fits: docs/vram-accounting.md.
+  Two lengths are the minimum: one can't separate a constant from a rate, and three tidy points at a single length produced a confident 4x error.
 
 ! Every literal below is TEMPORARY. The two coefficients are one host, one model, one backend, one sequence length.
   Intended replacement: a calibration step measuring them per `(model, backend)` at load time. Until then they're overridable so a disagreeing device isn't silently mispriced.
@@ -104,7 +104,7 @@ def allocate_state(lm, *, rows: int, sequence_length: int) -> ModelState:
     Source and destination of a hot admit are still ranges of the SAME tensor, which is what the page-transfer install needs; that never depended on adjacency, only on one block numbering.
 
     Raises `KVPagesExhausted` only when the supply is genuinely empty.
-    ! that exception is still uncaught between here and the scheduler (docs/HANDOFF.md). What changed is that fragmentation can no longer raise it.
+    ! that exception is still uncaught between here and the scheduler. What changed is that fragmentation can no longer raise it.
     """
     with mapped_whole():
         return init_states(

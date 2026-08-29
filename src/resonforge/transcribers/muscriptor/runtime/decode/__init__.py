@@ -12,8 +12,7 @@ are better answered elsewhere:
 * the **transient** is measured by `scheduler.device.block_pool` against the row count
   it is spent at (`transient_bytes_for`). A computed per-row figure was tried
   and is 6x wrong in production -- fitted on a bench that holds every row at
-  full length, spent on a workload whose rows are short and staggered
-  (`docs/vram-accounting.md` 5b-3).
+  full length, spent on a workload whose rows are short and staggered (5b-3).
 * the **graph private pool** needs no reserve at all. Its bytes are reserved
   from the driver through the caching allocator, so `mem_get_info` free has
   already excluded them by the time the pool view reads it. A flat 58 MiB

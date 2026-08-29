@@ -14,7 +14,6 @@ Three changes made this possible, each measured rather than argued:
   and is worth almost nothing where the forward already saturates the card (this box, fp32, compute-6.1). NEVER price this here.
 
 ! Bucketing is a budget, not a detail. A capture is expensive and a song's prefills concentrate in a couple of buckets, so capturing every bucket costs more than it saves and capturing the head doesn't.
-  Both sets of figures: docs/HANDOFF.md.
 """
 
 from __future__ import annotations
@@ -154,7 +153,7 @@ class PrefillGraphCache:
     Cost is paid once per entry PER LOADED MODEL, and a model outlives every song in a run, so the saving accumulates across songs while the bill doesn't -- break-even ~1.3 songs a model load.
     ! a one-song manifest is therefore the worst case it can be measured at, and measuring it there is how a cache that pays looks like one that doesn't.
 
-    16 rather than 6: a smaller cache was tried on the theory it would earn more per entry, and the hit rate collapsed far faster than the capture bill fell. Arms: docs/HANDOFF.md.
+    16 rather than 6: a smaller cache was tried on the theory it would earn more per entry, and the hit rate collapsed far faster than the capture bill fell.
     """
 
     def __init__(self, *, max_entries: int = 16) -> None:

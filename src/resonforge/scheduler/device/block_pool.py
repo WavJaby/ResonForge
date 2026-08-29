@@ -14,7 +14,6 @@ So the guarantee is "system makes progress" (a starved row releases), NOT "every
 Preemption is what removes hold-and-wait; starvation it does not, and starvation is neither bounded nor measured here.
 
 Still owned here: never admit past the point one row's floor can't be funded (`own_floor_blocks`) -- a supply too small for one row is starved, not deadlocked, and preempting everything does not help.
-Before/after table + why the previous design guessed: `docs/paging/`.
 """
 
 from __future__ import annotations
@@ -27,20 +26,19 @@ from dataclasses import dataclass
 # Not derivable here -- bytes/token is model geometry, this pool is model-agnostic. Layer count changes how many blocks a row takes, never how big one is.
 BLOCK_BYTES = 32 * 1024
 
-# No device-proportional reserve -- it scales with the card, not with the arena being opened.
-# docs/vram-accounting.md 5b-1.
+# No device-proportional reserve -- it scales with the card, not with the arena being opened (5b-1).
 
 
 # Seed for widths nothing has decoded at yet.
 # The transient can't be computed before allocating (depends which kernels run), and the first width on a fresh process would otherwise be priced against 0 -> CUDA OOM.
 # 64 MiB = per-row avg at production width, this host.
 # It's an avg of a mostly-fixed cost => wrong at every width but one, so `transient_bytes_for` overwrites it with a real reading per row-count and never interpolates (R6).
-# Fits + the widths they disagree at: docs/vram-accounting.md. Override: --decode-transient-per-row-mib
+# Override: --decode-transient-per-row-mib
 BOOTSTRAP_TRANSIENT_PER_ROW_BYTES = 64 * 1024**2
 _bootstrap_transient_per_row_bytes = BOOTSTRAP_TRANSIENT_PER_ROW_BYTES
 
 # No per-row cap on the measured price -- wrong at one end whatever you set it to, and readings are already scoped to the row count they were taken at.
-# Counter was 0 over a full run => demolition candidate, not a guard. docs/vram-accounting.md 5b-1.
+# Counter was 0 over a full run => demolition candidate, not a guard (5b-1).
 
 
 def set_bootstrap_transient_per_row_bytes(value: int) -> None:
@@ -72,7 +70,7 @@ def reserve_bytes(
 
     Tiles with `_effective_cost`, doesn't overlap it: that charges rows *about to be added*, this covers rows *already resident*. The boundary is the argument, so no double-counting.
 
-    No `total_bytes` on purpose -- a card-proportional reserve can't be right on two cards. docs/vram-accounting.md 5b-1.
+    No `total_bytes` on purpose -- a card-proportional reserve can't be right on two cards (5b-1).
     """
     if resident_rows < 0:
         raise ValueError("a device cannot hold a negative number of rows")
@@ -220,8 +218,7 @@ class DeviceBlockPool:
         self._lanes: dict[str, ArenaCost] = {}
         self._transient_high_water = 0
         # Priced at the width it's spent at, never divided by rows (R6).
-        # Keyed by row count, high-water *within* each count: the transient has a big fixed term and isn't linear in rows, so a ratio fitted at one width is wrong at every other.
-        # What the ratio cost: docs/PROJECT_MEMORY.md.
+        # Keyed by row count, high-water *within* each count: the transient has a big fixed term and isn't linear in rows, so a ratio fitted at one width is wrong at every other (measured: 83% of the device budget).
         self._transient_by_rows: dict[int, int] = {}
         # row count the current CUDA peak belongs to. None until first sample -> first width also gets a rebase.
         self._transient_width: int | None = None
@@ -313,7 +310,7 @@ class DeviceBlockPool:
         """Record the transient at the row count it was reached with.
 
         Replaces a per-row ratio, and that's the point: a ratio gets fitted at whatever width is open and spent at whatever comes next (a reserve is needed before the next width exists),
-        and it can't be right at both ends because the transient has a fixed term AND a length term. What the ratio cost: docs/PROJECT_MEMORY.md.
+        and it can't be right at both ends because the transient has a fixed term AND a length term (the fitted ratio cost 83% of the device budget, 2026-08-27).
 
         So: store the reading against its own row count instead of fitting coefficients on a host that can't re-measure per width.
         Price is always measured where it's spent; a width nobody has run falls back to the bootstrap, never to an extrapolation.
@@ -423,7 +420,6 @@ class DeviceBlockPool:
 
         Slope between two measured widths, NOT a total / rows: the total has a fixed term,
         so dividing overstates the marginal most at narrow widths -- exactly where a lane is deciding whether it can grow.
-        Both figures: docs/PROJECT_MEMORY.md.
 
         Bootstrap until two widths have readings; one point has no slope.
         """
@@ -542,7 +538,7 @@ def _reject_ambiguous_cuda_key(device: str) -> None:
 
     `cuda` and `cuda:0` are the same card and different dict keys, so mixing them gives one device TWO pools -- and the split is silent, because each is internally consistent.
     It happened: the scheduler said `cuda` while `_declare_kv_pool` re-derived `str(weight.device)`,
-    and the width declaration then priced its reserve against a pool that had never received a measurement (docs/PROJECT_MEMORY.md).
+    and the width declaration then priced its reserve against a pool that had never received a measurement.
 
     Whether two ordinals are two cards is knowable from the strings; whether `cuda` *is* `cuda:0` is not, without torch.
     So refuse the ambiguity instead of resolving it, which also names the real defect: two producers of device identity, where there must be one.

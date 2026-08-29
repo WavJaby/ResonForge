@@ -430,7 +430,7 @@ def parse_args() -> CliInvocation:
             "host). It is a high-water seed, so a device that needs more still "
             "gets more. 0 restores the pre-2026-08-26 behaviour of opening the "
             "first arena against a transient of zero, which spills on Windows "
-            "and OOMs on Linux. See docs/vram-accounting.md"
+            "and OOMs on Linux."
         ),
     )
     args = parser.parse_args()

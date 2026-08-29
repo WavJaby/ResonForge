@@ -11,7 +11,7 @@ Three reserves, each subtracted exactly once, at DEVICE scope:
   * `process`  -- passed in from `block_pool.reserve_bytes`. Nothing here re-derives it. That answers "how far above its steady allocation does this process go", a different question from the next.
   * `headroom` -- consumers this process doesn't own and can't measure: desktop, browser, the separation subprocess.
                   EVIDENCE MAY NOT LOWER THIS ONE -- the evidence is about us, not them. Without it the device was sized with zero allowance for anything outside the process,
-                  and on Windows the overflow spills to system memory at ~4.9x with no error at all (docs/vram-accounting.md).
+                  and on Windows the overflow spills to system memory at ~4.9x with no error at all.
   * `prefill`  -- the seam, and deliberately ZERO today. Prefill allocates after the pool takes its share, so a pool sized without it is sized wrong;
                   but `reserve_bytes` is a *process-wide* high-water and prefill's admission peak is already inside that reading.
                   Filling it today subtracts the same bytes twice -- measured 2026-08-27: free 8519 MiB, process 3754, headroom 512, prefill 4636, divisible **0**, every lane at width 1.
