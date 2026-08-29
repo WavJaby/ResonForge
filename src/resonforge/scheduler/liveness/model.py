@@ -112,10 +112,36 @@ class ModelRunState:
     session_resident: bool = True
     arena_blocks: int = 0
     resize_target: ModelResizeTarget | None = None
+    # This lane's KV page supply, in ROWS (`free // row_floor`, the unit
+    # admission works in). Per lane, not per device: a page serves one
+    # geometry only, so nothing shares it the way `pool_blocks` is shared.
+    # `None` = unpriced (off CUDA, or a lane with private arenas) -- the whole
+    # pre-2026-08-29 model, so every unpriced seed keeps its exact semantics.
+    # A priced supply below 1 is invalid, mirroring `DeviceCannotHoldOneRow`:
+    # production refuses that pool at the capacity read, so no reachable
+    # scheduler state carries it. RESIZE deliberately does not touch this --
+    # supply re-declaration on resize is not modelled yet.
+    page_rows: int | None = None
 
     @property
     def free(self) -> int:
         return self.width - self.committed_prefill - self.active - self.paused
+
+    @property
+    def held_page_rows(self) -> int:
+        """Rows currently holding KV pages.
+
+        Committed prefill leases from the pool (`acquire_contiguous`), active
+        rows hold theirs, and a PAUSED row keeps holding -- that is capture B's
+        whole complaint. A displaced row holds none: displacement is the act
+        of returning them, which is why `PREEMPT_CONDITION` is the escape
+        hatch that needs no free pages.
+        """
+        return self.committed_prefill + self.active + self.paused
+
+    @property
+    def free_page_rows(self) -> int | None:
+        return None if self.page_rows is None else self.page_rows - self.held_page_rows
 
     @property
     def resizing(self) -> bool:
@@ -269,6 +295,18 @@ def _resident_blocks(state: ModelState) -> int:
     )
 
 
+def _lane_pages_admit(run: ModelRunState, need: int = 1) -> bool:
+    """The page half of admission: `_pages_admit`, in the model's row unit.
+
+    Asked only of transitions that make a NEW row hold pages (admissions and
+    `RESTORE_DISPLACED`). Never of `PREEMPT_CONDITION` or `PREEMPT_RESTORE`,
+    whose held count is net zero -- gating those on free pages is exactly the
+    self-gated escape hatch deadlock capture A was, fixed 2026-08-26.
+    """
+    free = run.free_page_rows
+    return free is None or free >= need
+
+
 def _session_owner_free(run: ModelRunState) -> bool:
     return run.session_resident and not any(
         (
@@ -352,6 +390,16 @@ def validate_model_state(state: ModelState) -> None:
             raise ValueError(f"run {index} has a negative model counter")
         if run.arena_blocks < 0:
             raise ValueError(f"run {index} has negative arena resources")
+        if run.page_rows is not None:
+            # Mirrors `DeviceCannotHoldOneRow` (model_workers, 2026-08-29): a
+            # priced supply that can never fund one row is refused at the
+            # scheduler's capacity read, so no reachable state carries it.
+            if run.page_rows < 1:
+                raise ValueError(
+                    f"run {index} prices a page supply below one row"
+                )
+            if run.held_page_rows > run.page_rows:
+                raise ValueError(f"run {index} overcommits its page supply")
         target = run.resize_target
         if target is not None and (target.width < 1 or target.arena_blocks < 0):
             raise ValueError(f"run {index} has an invalid resize target")
@@ -424,7 +472,7 @@ def model_enabled_actions(state: ModelState) -> tuple[ModelAction, ...]:
     # it is **demand-limited, not rule-limited**. The first attempt ran at two
     # songs, where the lane's demand sits below its ceiling anyway and the rule
     # could not have been binding -- the re-ask at six songs, in the regime that
-    # could detect it, gave the same answer. Arms: `docs/scheduler-fill/`.
+    # could detect it, gave the same answer (scheduler-fill arms).
     #
     # The rule stays: it costs nothing and it keeps one dimension out of the
     # state space this model has to prove.
@@ -449,6 +497,7 @@ def model_enabled_actions(state: ModelState) -> tuple[ModelAction, ...]:
                 and run.free
                 and run.admission_safe
                 and not run.resource_blocked
+                and _lane_pages_admit(run)
             ):
                 actions.append(
                     ModelAction(
@@ -493,6 +542,9 @@ def model_enabled_actions(state: ModelState) -> tuple[ModelAction, ...]:
                 and state.runs[run_index].capacity_ready
                 and state.runs[run_index].admission_safe
                 and not state.runs[run_index].resource_blocked
+                # Members draw pages -- `_pool_admits`'s own words: theirs is
+                # the page pool's conservation law, not the device-byte one.
+                and _lane_pages_admit(state.runs[run_index], count)
                 for run_index, count in required.items()
             ):
                 actions.append(
@@ -597,7 +649,11 @@ def model_enabled_actions(state: ModelState) -> tuple[ModelAction, ...]:
         if run.restore_controls:
             if run.paused:
                 actions.append(ModelAction(index, ModelActionKind.RESTORE_PAUSED))
-            if run.displaced and run.free:
+            # Restoring a displaced row RE-ACQUIRES its pages (displacement
+            # returned them), so it needs a free slot and a free page row;
+            # short of either, a paused row is preempted instead -- net zero
+            # in both slots and pages, so it is never page-gated.
+            if run.displaced and run.free and _lane_pages_admit(run):
                 actions.append(ModelAction(index, ModelActionKind.RESTORE_DISPLACED))
             elif run.displaced and run.paused:
                 actions.append(ModelAction(index, ModelActionKind.PREEMPT_RESTORE))
@@ -620,6 +676,7 @@ def model_enabled_actions(state: ModelState) -> tuple[ModelAction, ...]:
             and run.free
             and not run.resource_blocked
             and _can_create_session(state, index)
+            and _lane_pages_admit(run)
         ):
             actions.extend(
                 (
@@ -669,6 +726,7 @@ def model_enabled_actions(state: ModelState) -> tuple[ModelAction, ...]:
                 or target.resource_blocked
                 or not donors
                 or target.arena_blocks < 1
+                or not _lane_pages_admit(target)
             ):
                 continue
             remaining = sum(

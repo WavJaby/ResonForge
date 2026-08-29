@@ -353,7 +353,7 @@ def enabled_actions(state: SchedulerState) -> tuple[SchedulerAction, ...]:
             # free slot. Since R1 there are two supplies, and **a lane can sit
             # on plenty of free slots with zero pages** -- which is how a
             # deadlock reached `enabled_actions == [fail]` while the cure sat
-            # one condition away (`docs/deadlock/`).
+            # one condition away (deadlock capture A).
             and (run.physical_available == 0 or not _pages_admit(run))
             and run.occupied > run.active
             and run.preempt_allowed
