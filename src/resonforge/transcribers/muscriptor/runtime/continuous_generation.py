@@ -258,6 +258,26 @@ def _snapshot_to_device(value: object, device: torch.device) -> object:
 
 
 
+class _InFlightQuantum:
+    """A launched, unconsumed graph replay (S5 host-async decode).
+
+    `tokens` is device-side; nothing has synchronized on it. `rows` pins each active slot's row identity at launch, so `consume_quantum` can refuse a slot mutation that slipped in between -- while a quantum is in flight the slots must not change."""
+
+    __slots__ = ("active", "rows", "tokens", "quantum")
+
+    def __init__(
+        self,
+        active: tuple[int, ...],
+        rows: tuple[int, ...],
+        tokens: torch.Tensor,
+        quantum: int,
+    ) -> None:
+        self.active = active
+        self.rows = rows
+        self.tokens = tokens
+        self.quantum = quantum
+
+
 class ContinuousGenerationBatch:
     """Keep a fixed physical batch while logical requests enter and leave."""
 
@@ -474,6 +494,8 @@ class ContinuousGenerationBatch:
         self._preemptions: Counter[str] = Counter()
         self._preemption_quantum: dict[tuple[int, int], int] = {}
         self._quanta = 0
+        # S5 host-async decode: one launched, unconsumed graph replay, or None. See `launch_quantum`.
+        self._in_flight_quantum: _InFlightQuantum | None = None
         self._cuda_graph_runtime = self._create_cuda_graph_runtime()
         # Decided once, here, and never revisited. A session that runs graph
         # decode runs *only* graph decode: reaching the per-token path below is
@@ -1944,6 +1966,123 @@ class ContinuousGenerationBatch:
                 active_steps_by_width,
             )
         return stats
+
+    # -- S5 host-async decode: launch a replay now, consume its tokens later.
+    # `run_quantum` stays the synchronous shape; these two are its split form.
+    # Contract: every True from `launch_quantum` owes exactly one
+    # `consume_quantum` before anything mutates the session's slots -- consume
+    # asserts row identity and fails closed on a mutation that slipped in.
+
+    @property
+    def split_decode_supported(self) -> bool:
+        """Whether this session can decode via launch/consume. Graph line only: eager samples one synced token at a time and has no unsynchronized half."""
+        return isinstance(self._decode_line, GraphLine)
+
+    @property
+    def quantum_in_flight(self) -> bool:
+        return self._in_flight_quantum is not None
+
+    @torch.inference_mode()
+    def launch_quantum(self, max_steps: int) -> bool:
+        """Launch one graph quantum without waiting for its tokens.
+
+        Returns False when there is nothing to launch: an eager line (one
+        synced token at a time is its only shape), or no active rows. Finished
+        rows are NOT published here -- launch takes no callbacks, so callers
+        run it only after a `consume_quantum` or `run_quantum` has drained
+        completions.
+        """
+        if self._in_flight_quantum is not None:
+            raise RuntimeError(
+                "a quantum is already in flight; consume it before launching"
+            )
+        if not isinstance(self._decode_line, GraphLine):
+            return False
+        if max_steps not in GRAPH_QUANTUM_FAMILY:
+            raise ValueError(
+                f"graph decode runs quanta of {sorted(GRAPH_QUANTUM_FAMILY)}, "
+                f"not {max_steps}; a session that needs another size has to be "
+                "opened with graph decode off"
+            )
+        self._restore_preempted_rows()
+        with self._phase_recorder.measure("decode"):
+            while True:
+                active = tuple(
+                    index
+                    for index, slot in enumerate(self.slots)
+                    if (
+                        slot.row is not None
+                        and not slot.paused
+                        and not slot.row.finished
+                    )
+                )
+                if not active:
+                    return False
+                _, grow_rows = self._active_state_rows(active)
+                try:
+                    grow_state_rows(self.model_state, grow_rows, ahead=max_steps)
+                except KVPagesExhausted:
+                    if not self._preempt_for_pages(active):
+                        raise
+                    continue
+                if not self._rows_allow_graph(active):
+                    raise RuntimeError(
+                        "graph decode reached the per-token path: "
+                        f"active={len(active)} width={self.width}. A row "
+                        "carrying a trace collector has to select eager decode "
+                        "for the whole process instead."
+                    )
+                tokens = self._try_cuda_graph_quantum(active, quantum=max_steps)
+                if tokens is None:
+                    raise RuntimeError(
+                        "graph decode could not replay: "
+                        f"active={len(active)} quantum={max_steps} "
+                        f"width={self.width}. The mode is chosen when the "
+                        "session opens and has no fallback."
+                    )
+                self._quanta += 1
+                self._in_flight_quantum = _InFlightQuantum(
+                    active=active,
+                    rows=tuple(id(self.slots[index].row) for index in active),
+                    tokens=tokens,
+                    quantum=max_steps,
+                )
+                return True
+
+    @torch.inference_mode()
+    def consume_quantum(
+        self,
+        completed: Callable[[GenerationRequest, GenerationResult], None],
+        released: Callable[[int, int], None] | None = None,
+        checkpointed: Callable[[GenerationRequest, GenerationResult], None]
+        | None = None,
+    ) -> ContinuousGenerationStats:
+        """Synchronize on the in-flight replay and apply its tokens."""
+        in_flight = self._in_flight_quantum
+        if in_flight is None:
+            raise RuntimeError("no quantum is in flight")
+        self._in_flight_quantum = None
+        for index, row_id in zip(in_flight.active, in_flight.rows, strict=True):
+            row = self.slots[index].row
+            if row is None or id(row) != row_id:
+                raise RuntimeError(
+                    f"slot {index} changed while a quantum was in flight; "
+                    "every path that mutates rows must consume first"
+                )
+        with self._phase_recorder.measure("decode"):
+            steps, wasted, widths = self._consume_graph_quantum(
+                in_flight.active,
+                in_flight.tokens,
+                completed,
+                released,
+                checkpointed,
+            )
+        return ContinuousGenerationStats(
+            physical_steps=steps,
+            wasted_token_rows=wasted,
+            replacements=0,
+            active_steps_by_width=widths,
+        )
 
     def _rows_allow_graph(self, active: tuple[int, ...]) -> bool:
         """Whether every active row can be fed by a replay.
