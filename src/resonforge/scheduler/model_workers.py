@@ -2756,6 +2756,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 "discard",
                 operation_started,
                 slots_before,
+                handle_key=handle_key,
             )
             return
         request = run.session.resume(handle)
@@ -2772,6 +2773,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             "resume",
             operation_started,
             slots_before,
+            handle_key=handle_key,
         )
 
     def _collect_preemption_telemetry(self, run: _PersistentRun[_ModelT]) -> None:
@@ -3407,6 +3409,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                     "checkpoint",
                     checkpoint_started,
                     self._waterfall_slots(run),
+                    handle_key=self._resident_handle_key(resident_handle),
                 )
             task, prepared = run.active_by_item.pop(id(item))
             claim_token: DependencyClaimToken | None = None
@@ -3617,6 +3620,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         *,
         finished_at: float | None = None,
         dispatch_readiness: dict[str, int] | None = None,
+        handle_key: tuple[int, int, int] | None = None,
     ) -> None:
         if not self._observer.trace_spans:
             return
@@ -3664,6 +3668,14 @@ class ModelWorkerPool(Generic[_ModelT]):
                 "compatible_ready_width": (
                     condition_ready + prefill_ready + decode_ready
                 ),
+                # Which resident row this event acted on, as
+                # `resident_handle_key`'s (session, slot, generation). The
+                # slot lists say what the lane held; only this says what the
+                # event *did*, and without it a checkpoint cannot be paired
+                # with its own resolution -- a session carries many rows and
+                # many controls, so a session-level join matches other rows'
+                # events (tried 2026-08-30: p50 2.5 s, p90 19.8 s, unusable).
+                "handle": list(handle_key) if handle_key is not None else None,
                 "slots_before": slots_before,
                 "slots_after": slots_after,
                 **(dispatch_readiness or {}),
