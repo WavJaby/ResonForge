@@ -18,7 +18,7 @@ from muscriptor.generation_batch import GenerationRequest
 from muscriptor.modules.streaming import ModelState, increment_steps
 
 from resonforge.transcribers.muscriptor.runtime.generation_state import (
-    slot_state_rows,
+    slot_state_row_indices,
 )
 from resonforge.transcribers.muscriptor.runtime.instrumentation import (
     _CudaPhaseRecorder,
@@ -146,6 +146,24 @@ def _temporal_metadata(
     )
 
 
+def _condition_rows(
+    source: torch.Tensor,
+    row_indices: tuple[int, ...],
+) -> torch.Tensor:
+    """Take one prefill row's slice of a whole-batch condition tensor.
+
+    A single index is a contiguous slice, so this is a view and issues no
+    kernel; the CFG pair is not contiguous and is concatenated, which is what
+    `split_prepared_condition_batch` does with the same tensors.
+    """
+    if len(row_indices) == 1:
+        return source.narrow(0, row_indices[0], 1)
+    return torch.cat(
+        [source.narrow(0, index, 1) for index in row_indices],
+        dim=0,
+    )
+
+
 def _rows_from_first_token(
     *,
     lm,
@@ -179,18 +197,26 @@ def _rows_from_first_token(
         # Allocating a private per-row state and copying into it doubled the
         # prefill KV footprint -- a second full allocation outside the block
         # pool -- to produce a buffer whose only job was to be copied a second
-        # time. `slot_state_rows` gives the same (row, row + batch_size) pair
-        # the hand-built tensors did, from the one definition of that mapping.
-        source_rows = slot_state_rows(
+        # time. `slot_state_row_indices` gives the same (row, row + batch_size)
+        # pair the hand-built tensors did, from the one definition of that map.
+        #
+        # HOST indices, and `narrow` rather than a gather: the fancy-index form
+        # built one index tensor per row (an H2D copy each) and issued two
+        # gathers per condition per row. A single row is one contiguous slice,
+        # so it is a view and costs no kernel at all; only the CFG pair needs a
+        # copy, and it is assembled the same way `split_prepared_condition_batch`
+        # already assembles it. Rows of one batch are installed and released
+        # together (`admit_prepared_many` -> `install` -> `release_prefill`, or
+        # `_release_refused`), so a view holds nothing alive past its copy would.
+        row_indices = slot_state_row_indices(
             row,
             batch_size,
             cfg_enabled=cfg_enabled,
-            device=lm.emb.weight.device,
         )
         private_conditions = {
             name: (
-                condition[source_rows],
-                mask[source_rows],
+                _condition_rows(condition, row_indices),
+                _condition_rows(mask, row_indices),
             )
             for name, (condition, mask) in conditions.items()
         }
