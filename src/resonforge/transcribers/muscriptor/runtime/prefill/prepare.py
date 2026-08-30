@@ -146,6 +146,90 @@ def _temporal_metadata(
     )
 
 
+def _rows_from_first_token(
+    *,
+    lm,
+    requests,
+    prompts,
+    next_tokens: torch.Tensor,
+    temporal_floors: torch.Tensor,
+    conditions,
+    state,
+    arena,
+    batch_size: int,
+    cfg_enabled: bool,
+    decode_span,
+) -> tuple[PreparedGenerationRow, ...]:
+    """Turn one prefill batch's first tokens into prepared rows.
+
+    Both prefill paths -- ragged and conditioned -- ended a batch this exact
+    way, in two byte-identical loops that had to be kept in agreement by hand.
+
+    The two host reads happen ONCE for the batch, not once per row: they are
+    per-row scalars off whole-batch tensors, so the per-row form paid 2N syncs
+    for what 2 buy. `phase_occupancy.py --host-reads` measured them as the only
+    device reads the prefill phase makes.
+    """
+    next_tokens_host = next_tokens.tolist()
+    temporal_floors_host = temporal_floors.tolist()
+    prepared = []
+    for row, (request, prompt) in enumerate(zip(requests, prompts, strict=True)):
+        # This row is logical slot `row` of a width-`batch_size` prefill, and
+        # `copy_prepared_slot_state` reads it there when the row is admitted.
+        # Allocating a private per-row state and copying into it doubled the
+        # prefill KV footprint -- a second full allocation outside the block
+        # pool -- to produce a buffer whose only job was to be copied a second
+        # time. `slot_state_rows` gives the same (row, row + batch_size) pair
+        # the hand-built tensors did, from the one definition of that mapping.
+        source_rows = slot_state_rows(
+            row,
+            batch_size,
+            cfg_enabled=cfg_enabled,
+            device=lm.emb.weight.device,
+        )
+        private_conditions = {
+            name: (
+                condition[source_rows],
+                mask[source_rows],
+            )
+            for name, (condition, mask) in conditions.items()
+        }
+        next_token = int(next_tokens_host[row])
+        emitted_eos = next_token == request.eos_id
+        if not emitted_eos:
+            prompt.append(next_token)
+        steps = len(request.prompt_ids) + 1
+        temporal_floor = _advanced_temporal_floor(
+            request,
+            int(temporal_floors_host[row]),
+            next_token,
+        )
+        prepared.append(
+            PreparedGenerationRow(
+                request=request,
+                model_state=state,
+                prefill_arena=arena,
+                source_slot=row,
+                source_width=batch_size,
+                conditions=private_conditions,
+                tokens=prompt,
+                last_token=next_token,
+                steps=steps,
+                finished=emitted_eos or steps >= request.max_gen_len,
+                emitted_eos=emitted_eos,
+                decode_span=decode_span,
+                temporal_floor=temporal_floor,
+                checkpoint_floor=(
+                    -1
+                    if request.temporal_grammar is None
+                    or request.temporal_grammar.checkpoint_floor is None
+                    else request.temporal_grammar.checkpoint_floor
+                ),
+            )
+        )
+    return tuple(prepared)
+
+
 def _advanced_temporal_floor(
     request: GenerationRequest,
     floor: int,
@@ -299,62 +383,19 @@ def _prepare_generation_rows_ragged(
             trace_contexts=tuple(request.trace_context for request in requests),
         )
 
-    prepared = []
-    for row, (request, prompt) in enumerate(zip(requests, prompts, strict=True)):
-        # This row is logical slot `row` of a width-`batch_size` prefill, and
-        # `copy_prepared_slot_state` reads it there when the row is admitted.
-        # Allocating a private per-row state and copying into it doubled the
-        # prefill KV footprint -- a second full allocation outside the block
-        # pool -- to produce a buffer whose only job was to be copied a second
-        # time. `slot_state_rows` gives the same (row, row + batch_size) pair
-        # the hand-built tensors did, from the one definition of that mapping.
-        source_rows = slot_state_rows(
-            row,
-            batch_size,
-            cfg_enabled=cfg_enabled,
-            device=lm.emb.weight.device,
-        )
-        private_conditions = {
-            name: (
-                condition[source_rows],
-                mask[source_rows],
-            )
-            for name, (condition, mask) in conditions.items()
-        }
-        next_token = int(next_tokens[row])
-        emitted_eos = next_token == request.eos_id
-        if not emitted_eos:
-            prompt.append(next_token)
-        steps = len(request.prompt_ids) + 1
-        temporal_floor = _advanced_temporal_floor(
-            request,
-            int(temporal_floors[row].item()),
-            next_token,
-        )
-        prepared.append(
-            PreparedGenerationRow(
-                request=request,
-                model_state=state,
-                prefill_arena=arena,
-                source_slot=row,
-                source_width=batch_size,
-                conditions=private_conditions,
-                tokens=prompt,
-                last_token=next_token,
-                steps=steps,
-                finished=emitted_eos or steps >= request.max_gen_len,
-                emitted_eos=emitted_eos,
-                decode_span=decode_span,
-                temporal_floor=temporal_floor,
-                checkpoint_floor=(
-                    -1
-                    if request.temporal_grammar is None
-                    or request.temporal_grammar.checkpoint_floor is None
-                    else request.temporal_grammar.checkpoint_floor
-                ),
-            )
-        )
-    return tuple(prepared)
+    return _rows_from_first_token(
+        lm=lm,
+        requests=requests,
+        prompts=prompts,
+        next_tokens=next_tokens,
+        temporal_floors=temporal_floors,
+        conditions=conditions,
+        state=state,
+        arena=arena,
+        batch_size=batch_size,
+        cfg_enabled=cfg_enabled,
+        decode_span=decode_span,
+    )
 
 
 #: Where `--muscriptor-prefill-runtime` lands on a loaded model. Stamped by
@@ -998,60 +1039,17 @@ def prepare_generation_rows(
         increment=sequence.shape[1] + prepend_length,
     )
 
-    prepared = []
-    for row, (request, prompt) in enumerate(zip(requests, prompts, strict=True)):
-        # This row is logical slot `row` of a width-`batch_size` prefill, and
-        # `copy_prepared_slot_state` reads it there when the row is admitted.
-        # Allocating a private per-row state and copying into it doubled the
-        # prefill KV footprint -- a second full allocation outside the block
-        # pool -- to produce a buffer whose only job was to be copied a second
-        # time. `slot_state_rows` gives the same (row, row + batch_size) pair
-        # the hand-built tensors did, from the one definition of that mapping.
-        source_rows = slot_state_rows(
-            row,
-            batch_size,
-            cfg_enabled=cfg_enabled,
-            device=lm.emb.weight.device,
-        )
-        private_conditions = {
-            name: (
-                condition[source_rows],
-                mask[source_rows],
-            )
-            for name, (condition, mask) in conditions.items()
-        }
-        next_token = int(next_tokens[row])
-        emitted_eos = next_token == request.eos_id
-        if not emitted_eos:
-            prompt.append(next_token)
-        steps = len(request.prompt_ids) + 1
-        temporal_floor = _advanced_temporal_floor(
-            request,
-            int(temporal_floors[row].item()),
-            next_token,
-        )
-        prepared.append(
-            PreparedGenerationRow(
-                request=request,
-                model_state=state,
-                prefill_arena=arena,
-                source_slot=row,
-                source_width=batch_size,
-                conditions=private_conditions,
-                tokens=prompt,
-                last_token=next_token,
-                steps=steps,
-                finished=emitted_eos or steps >= request.max_gen_len,
-                emitted_eos=emitted_eos,
-                decode_span=decode_span,
-                temporal_floor=temporal_floor,
-                checkpoint_floor=(
-                    -1
-                    if request.temporal_grammar is None
-                    or request.temporal_grammar.checkpoint_floor is None
-                    else request.temporal_grammar.checkpoint_floor
-                ),
-            )
-        )
-    return tuple(prepared)
+    return _rows_from_first_token(
+        lm=lm,
+        requests=requests,
+        prompts=prompts,
+        next_tokens=next_tokens,
+        temporal_floors=temporal_floors,
+        conditions=conditions,
+        state=state,
+        arena=arena,
+        batch_size=batch_size,
+        cfg_enabled=cfg_enabled,
+        decode_span=decode_span,
+    )
 
