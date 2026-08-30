@@ -3221,19 +3221,13 @@ class ModelWorkerPool(Generic[_ModelT]):
                     # Nothing consumed and nothing to launch, yet DECODE was
                     # legal: `active_count` counts a preempted row no slot
                     # holds, and its restore can be refused (never take the
-                    # last page). Sync mode live-spins here legally -- an
-                    # empty quantum retries the restore and `quantum_count`
-                    # moves the version. Reproduce exactly that; skipping it
-                    # left an APPLIED action that changed nothing, which the
-                    # progress contract kills (found on the first 16-song
+                    # last page). The launch already retried the restore;
+                    # counting the empty quantum is what moves the version so
+                    # the spin registers as progress -- without it this is an
+                    # APPLIED action that changed nothing and the progress
+                    # contract kills the device (found on the first 16-song
                     # async arm, 2026-08-30).
-                    stats = session.run_quantum(
-                        quantum_steps,
-                        lambda item, result: completed.append((item, result)),
-                        checkpointed=lambda item, result: completed.append(
-                            (item, result)
-                        ),
-                    )
+                    run.quantum_count += 1
             else:
                 stats = session.run_quantum(
                     quantum_steps,
