@@ -35,7 +35,6 @@ from resonforge.transcribers.muscriptor.runtime.decode.graphs import (
     ContinuousDecodeGraphRuntime,
 )
 from resonforge.transcribers.muscriptor.runtime.decode.lines import (
-    GRAPH_QUANTUM_FAMILY,
     DecodeLine,
     EagerLine,
     GraphLine,
@@ -1932,51 +1931,30 @@ class ContinuousGenerationBatch:
         checkpointed: Callable[[GenerationRequest, GenerationResult], None]
         | None = None,
     ) -> ContinuousGenerationStats:
-        """Run bounded active-row decode while preserving unfinished state."""
-        if max_steps < 1:
-            raise ValueError("quantum must be positive")
-        self._quanta += 1
-        if (
-            isinstance(self._decode_line, GraphLine)
-            and max_steps not in GRAPH_QUANTUM_FAMILY
-        ):
-            # Rejected at the door rather than deep in the loop, because the
-            # answer is "open an eager session", not "retry smaller". A graph
-            # session has no per-token path to fall back to.
-            raise ValueError(
-                f"graph decode runs quanta of {sorted(GRAPH_QUANTUM_FAMILY)}, "
-                f"not {max_steps}; a session that needs another size has to be "
-                "opened with graph decode off"
-            )
-        physical_steps = 0
-        active_steps_by_width: dict[int, int] = {}
+        """One synchronous quantum: launch and consume back to back.
+
+        A convenience composition, not a second decode implementation -- the
+        scheduler drives the two halves itself (S5) and this exists for
+        callers that want one call per quantum (gates, benchmarks, tests).
+        """
         self.collect_finished(completed, released)
         if checkpointed is not None:
             self.collect_checkpoints(checkpointed)
-        # After the finished rows have given their pages back, so a preempted
-        # row is measured against what is actually free.
-        self._restore_preempted_rows()
-        with self._phase_recorder.measure("decode"):
-            stats = self._run_decode_steps(
-                max_steps,
-                completed,
-                released,
-                checkpointed,
-                physical_steps,
-                active_steps_by_width,
+        if not self.launch_quantum(max_steps):
+            return ContinuousGenerationStats(
+                physical_steps=0,
+                wasted_token_rows=0,
+                replacements=0,
+                active_steps_by_width={},
             )
-        return stats
+        return self.consume_quantum(completed, released, checkpointed)
 
-    # -- S5 host-async decode: launch a replay now, consume its tokens later.
-    # `run_quantum` stays the synchronous shape; these two are its split form.
-    # Contract: every True from `launch_quantum` owes exactly one
-    # `consume_quantum` before anything mutates the session's slots -- consume
-    # asserts row identity and fails closed on a mutation that slipped in.
-
-    @property
-    def split_decode_supported(self) -> bool:
-        """Whether this session can decode via launch/consume. Graph line only: eager samples one synced token at a time and has no unsynchronized half."""
-        return isinstance(self._decode_line, GraphLine)
+    # -- S5 host-async decode: launch a quantum now, consume its tokens later.
+    # One protocol for both lines since 2026-08-30; which launch runs is
+    # `self._decode_line`. Contract: every True from `launch_quantum` owes
+    # exactly one `consume_quantum` before anything mutates the session's
+    # slots -- consume asserts row identity and fails closed on a mutation
+    # that slipped in.
 
     @property
     def quantum_in_flight(self) -> bool:
@@ -1984,26 +1962,20 @@ class ContinuousGenerationBatch:
 
     @torch.inference_mode()
     def launch_quantum(self, max_steps: int) -> bool:
-        """Launch one graph quantum without waiting for its tokens.
+        """Launch one quantum without waiting for its tokens.
 
-        Returns False when there is nothing to launch: an eager line (one
-        synced token at a time is its only shape), or no active rows. Finished
-        rows are NOT published here -- launch takes no callbacks, so callers
-        run it only after a `consume_quantum` or `run_quantum` has drained
-        completions.
+        Returns False when there are no active rows. Finished rows are NOT
+        published here -- launch takes no callbacks, so callers run it only
+        after a `consume_quantum` or `run_quantum` has drained completions.
         """
+        if max_steps < 1:
+            raise ValueError("quantum must be positive")
         if self._in_flight_quantum is not None:
             raise RuntimeError(
                 "a quantum is already in flight; consume it before launching"
             )
-        if not isinstance(self._decode_line, GraphLine):
-            return False
-        if max_steps not in GRAPH_QUANTUM_FAMILY:
-            raise ValueError(
-                f"graph decode runs quanta of {sorted(GRAPH_QUANTUM_FAMILY)}, "
-                f"not {max_steps}; a session that needs another size has to be "
-                "opened with graph decode off"
-            )
+        # After the finished rows have given their pages back (the caller's
+        # consume), so a preempted row is measured against what is free.
         self._restore_preempted_rows()
         with self._phase_recorder.measure("decode"):
             while True:
@@ -2018,28 +1990,22 @@ class ContinuousGenerationBatch:
                 )
                 if not active:
                     return False
+                # Before the launch, not during: a graph replay writes every position of its quantum with no Python in it, so a page it will need must already be in the table; the eager line writes the same positions.
+                # One batched update per quantum, no-op for every row that hasn't crossed a block boundary since the last.
+                # PHYSICAL rows, not slots: a CFG-doubled state writes each row's twin at `slot + width`, and a twin nobody grew has no page under the position about to be written.
+                # Nothing enables CFG on this path today (`cfg_coef` is 1.0 everywhere), which is exactly why it has to be right here rather than found later.
                 _, grow_rows = self._active_state_rows(active)
                 try:
                     grow_state_rows(self.model_state, grow_rows, ahead=max_steps)
                 except KVPagesExhausted:
+                    # Release rather than wait: a row that can't be given a page gives one up instead, which is what keeps this from being hold-and-wait.
+                    # The victim is rebuilt exactly when there's room again -- see `restore_preempted`.
                     if not self._preempt_for_pages(active):
                         raise
                     continue
-                if not self._rows_allow_graph(active):
-                    raise RuntimeError(
-                        "graph decode reached the per-token path: "
-                        f"active={len(active)} width={self.width}. A row "
-                        "carrying a trace collector has to select eager decode "
-                        "for the whole process instead."
-                    )
-                tokens = self._try_cuda_graph_quantum(active, quantum=max_steps)
-                if tokens is None:
-                    raise RuntimeError(
-                        "graph decode could not replay: "
-                        f"active={len(active)} quantum={max_steps} "
-                        f"width={self.width}. The mode is chosen when the "
-                        "session opens and has no fallback."
-                    )
+                tokens = self._decode_line.launch(
+                    self, active, quantum=max_steps
+                )
                 self._quanta += 1
                 self._in_flight_quantum = _InFlightQuantum(
                     active=active,
@@ -2094,72 +2060,6 @@ class ContinuousGenerationBatch:
             self.slots[index].row is not None
             and _collector_allows_graph(self.slots[index].row.request.trace_collector)
             for index in active
-        )
-
-    def _run_decode_steps(
-        self,
-        max_steps: int,
-        completed: Callable[[GenerationRequest, GenerationResult], None],
-        released: Callable[[int, int], None] | None,
-        checkpointed: Callable[[GenerationRequest, GenerationResult], None]
-        | None,
-        physical_steps: int,
-        active_steps_by_width: dict[int, int],
-    ) -> ContinuousGenerationStats:
-        """Advance the rows that have work, one line's step at a time.
-
-        The loop owns what both lines share -- which rows are active, and that
-        their pages exist before the step -- and nothing else. Which step to
-        take is `self._decode_line`, chosen when the session opened.
-        """
-        wasted_token_rows = 0
-        for _ in range(max_steps):
-            active = tuple(
-                index
-                for index, slot in enumerate(self.slots)
-                if (
-                    slot.row is not None
-                    and not slot.paused
-                    and not slot.row.finished
-                )
-            )
-            if not active:
-                break
-            remaining = max_steps - physical_steps
-            # Before the step, not during: a graph replay writes every position of its quantum with no Python in it, so a page it will need must already be in the table.
-            # One batched update per quantum, no-op for every row that hasn't crossed a block boundary since the last.
-            # PHYSICAL rows, not slots: a CFG-doubled state writes each row's twin at `slot + width`, and a twin nobody grew has no page under the position about to be written.
-            # Nothing enables CFG on this path today (`cfg_coef` is 1.0 everywhere), which is exactly why it has to be right here rather than found later.
-            _, grow_rows = self._active_state_rows(active)
-            try:
-                grow_state_rows(self.model_state, grow_rows, ahead=remaining)
-            except KVPagesExhausted:
-                # Release rather than wait: a row that can't be given a page gives one up instead, which is what keeps this from being hold-and-wait.
-                # The victim is rebuilt exactly when there's room again -- see `restore_preempted`.
-                if not self._preempt_for_pages(active):
-                    raise
-                continue
-            outcome = self._decode_line.advance(
-                self,
-                active,
-                remaining=remaining,
-                completed=completed,
-                released=released,
-                checkpointed=checkpointed,
-            )
-            physical_steps += outcome.physical_steps
-            wasted_token_rows += outcome.wasted_token_rows
-            for width, steps in outcome.widths.items():
-                active_steps_by_width[width] = (
-                    active_steps_by_width.get(width, 0) + steps
-                )
-            if outcome.stop:
-                break
-        return ContinuousGenerationStats(
-            physical_steps=physical_steps,
-            wasted_token_rows=wasted_token_rows,
-            replacements=0,
-            active_steps_by_width=active_steps_by_width,
         )
 
 def create_continuous_generation_session(

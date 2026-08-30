@@ -3199,43 +3199,54 @@ class ModelWorkerPool(Generic[_ModelT]):
                     decode_started - self._last_decode_quantum_finished_at,
                 )
                 run.stats.scheduler_boundary_gap_count += 1
-            if getattr(session, "split_decode_supported", False):
-                # S5c: consume the previous launch's tokens (a full sync), then
-                # launch the next replay and return while it runs -- the
-                # scheduler's decision work and the other lane's dispatches
-                # execute beside it. The first dispatch of a burst launches
-                # only; the last is consumed by a later dispatch or by
-                # `_drain_in_flight_quantum` on the next slot-mutating action.
-                stats = (
-                    session.consume_quantum(
-                        lambda item, result: completed.append((item, result)),
-                        checkpointed=lambda item, result: completed.append(
-                            (item, result)
-                        ),
-                    )
-                    if session.quantum_in_flight
-                    else None
-                )
-                launched = session.launch_quantum(quantum_steps)
-                if stats is None and not launched:
-                    # Nothing consumed and nothing to launch, yet DECODE was
-                    # legal: `active_count` counts a preempted row no slot
-                    # holds, and its restore can be refused (never take the
-                    # last page). The launch already retried the restore;
-                    # counting the empty quantum is what moves the version so
-                    # the spin registers as progress -- without it this is an
-                    # APPLIED action that changed nothing and the progress
-                    # contract kills the device (found on the first 16-song
-                    # async arm, 2026-08-30).
-                    run.quantum_count += 1
-            else:
-                stats = session.run_quantum(
-                    quantum_steps,
+            # S5c: consume the previous launch's tokens (a full sync), then
+            # launch the next quantum and return while it runs -- the
+            # scheduler's decision work and the other lane's dispatches
+            # execute beside it. The first dispatch of a burst launches only;
+            # the last is consumed by a later dispatch or by
+            # `_drain_in_flight_quantum` on the next slot-mutating action.
+            stats = (
+                session.consume_quantum(
                     lambda item, result: completed.append((item, result)),
                     checkpointed=lambda item, result: completed.append(
                         (item, result)
                     ),
                 )
+                if session.quantum_in_flight
+                else None
+            )
+            launched = session.launch_quantum(quantum_steps)
+            if stats is None and not launched:
+                # Nothing consumed and nothing to launch, yet DECODE was
+                # legal: `active_count` counts a preempted row no slot
+                # holds, and its restore can be refused (never take the
+                # last page). The launch already retried the restore;
+                # counting the empty quantum is what moves the version so
+                # the spin registers as progress -- without it this is an
+                # APPLIED action that changed nothing and the progress
+                # contract kills the device (found on the first 16-song
+                # async arm, 2026-08-30).
+                #
+                # And the spin must PUBLISH, not just count: a paused row's
+                # checkpoint reaches its holder through these collects, the
+                # holder's decision is what moves pages, and pages are what
+                # un-refuse the restore. Counting alone wedged the CUDA
+                # release-admit case in an infinite spin -- every live row
+                # paused, restore refused, nobody ever told the holders.
+                collect_finished = getattr(session, "collect_finished", None)
+                if callable(collect_finished):
+                    collect_finished(
+                        lambda item, result: completed.append((item, result)),
+                        None,
+                    )
+                collect_checkpoints = getattr(
+                    session, "collect_checkpoints", None
+                )
+                if callable(collect_checkpoints):
+                    collect_checkpoints(
+                        lambda item, result: completed.append((item, result))
+                    )
+                run.quantum_count += 1
             self._last_decode_quantum_finished_at = time.perf_counter()
             if waterfall_action == "session_init":
                 session_first_decode_span = (
