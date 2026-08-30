@@ -219,6 +219,30 @@ class SchedulerAction:
     participants: tuple[int, ...] = ()
 
 
+def run_owner_free(state: SchedulerRunState) -> bool:
+    """A resident lane holding nothing -- the only state a resize or an owner-free
+    reclamation is legal in.
+
+    THE predicate, not a copy of one: it was written out inline in the reclaim
+    donor check and again in `model_workers._run_session_owner_free`, and a
+    field added to one of them would have silently loosened the other.
+    """
+    return state.session_exists and not any(
+        (
+            state.controls,
+            state.prefill,
+            state.in_flight,
+            state.tracked,
+            state.active,
+            state.occupied,
+            state.resident_handles,
+            state.control_intents,
+            state.producer_waits,
+            state.bundle_owned_handles,
+        )
+    )
+
+
 def _pages_admit(run: SchedulerRunState) -> bool:
     """Can this lane's page supply fund one more row?
 
@@ -487,20 +511,7 @@ def validate_scheduler_state(state: SchedulerState) -> None:
             )
         for donor_id in reclaim.donor_run_ids:
             donor = runs_by_id[donor_id]
-            if not donor.session_exists or any(
-                (
-                    donor.controls,
-                    donor.prefill,
-                    donor.in_flight,
-                    donor.tracked,
-                    donor.active,
-                    donor.occupied,
-                    donor.resident_handles,
-                    donor.control_intents,
-                    donor.producer_waits,
-                    donor.bundle_owned_handles,
-                )
-            ):
+            if not run_owner_free(donor):
                 raise SchedulerInvariantError(
                     "scheduler reclaim donor retains session ownership"
                 )

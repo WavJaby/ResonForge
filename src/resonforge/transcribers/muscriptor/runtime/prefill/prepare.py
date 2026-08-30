@@ -245,15 +245,23 @@ def _rows_from_first_token(
                 emitted_eos=emitted_eos,
                 decode_span=decode_span,
                 temporal_floor=temporal_floor,
-                checkpoint_floor=(
-                    -1
-                    if request.temporal_grammar is None
-                    or request.temporal_grammar.checkpoint_floor is None
-                    else request.temporal_grammar.checkpoint_floor
-                ),
+                checkpoint_floor=_checkpoint_floor(request),
             )
         )
     return tuple(prepared)
+
+
+def _checkpoint_floor(request: GenerationRequest) -> int:
+    """This request's declared checkpoint floor, or -1 for none.
+
+    One spelling. It was written out at all three `PreparedGenerationRow`
+    construction sites, and the sentinel is the kind of value that drifts
+    silently: a row built with the wrong one keeps decoding.
+    """
+    grammar = request.temporal_grammar
+    if grammar is None or grammar.checkpoint_floor is None:
+        return -1
+    return grammar.checkpoint_floor
 
 
 def _advanced_temporal_floor(
@@ -716,12 +724,7 @@ def _row_from_prefill(
         temporal_floor=_advanced_temporal_floor(
             request, int(temporal_floor_source[0].item()), next_token
         ),
-        checkpoint_floor=(
-            -1
-            if request.temporal_grammar is None
-            or request.temporal_grammar.checkpoint_floor is None
-            else request.temporal_grammar.checkpoint_floor
-        ),
+        checkpoint_floor=_checkpoint_floor(request),
     )
 
 
@@ -807,33 +810,15 @@ def _prepare_generation_row_with_conditions(
         state,
         increment=sequence.shape[1] + prepend_length,
     )
-    emitted_eos = next_token == request.eos_id
-    if not emitted_eos:
-        prompt.append(next_token)
-    steps = len(request.prompt_ids) + 1
-    temporal_floor = _advanced_temporal_floor(
+    return _row_from_prefill(
         request,
-        int(temporal_floors[0].item()),
+        state,
+        conditions,
+        prompt,
         next_token,
-    )
-    return PreparedGenerationRow(
-        request=request,
-        model_state=state,
-        prefill_arena=arena,
-        conditions=conditions,
-        tokens=prompt,
-        last_token=next_token,
-        steps=steps,
-        finished=emitted_eos or steps >= request.max_gen_len,
-        emitted_eos=emitted_eos,
         decode_span=decode_span,
-        temporal_floor=temporal_floor,
-        checkpoint_floor=(
-            -1
-            if request.temporal_grammar is None
-            or request.temporal_grammar.checkpoint_floor is None
-            else request.temporal_grammar.checkpoint_floor
-        ),
+        temporal_floor_source=temporal_floors,
+        arena=arena,
     )
 
 
@@ -946,38 +931,8 @@ def prepare_generation_rows(
     prompts = [
         list(request.prompt_ids[: request.max_gen_len]) for request in requests
     ]
-    if all(len(prompt) >= request.max_gen_len for prompt, request in zip(
-        prompts, requests, strict=True
-    )):
-        return tuple(
-            _prepare_generation_row_with_conditions(
-                lm,
-                request,
-                {
-                    name: (
-                        condition[
-                            [
-                                row,
-                                row + batch_size,
-                            ]
-                            if cfg_enabled
-                            else [row]
-                        ],
-                        mask[
-                            [
-                                row,
-                                row + batch_size,
-                            ]
-                            if cfg_enabled
-                            else [row]
-                        ],
-                    )
-                    for name, (condition, mask) in conditions.items()
-                },
-                phase_recorder=phase_recorder,
-            )
-            for row, request in enumerate(requests)
-        )
+    # One row at its length cap takes the whole cohort private: a packed prefill would still have to install the capped row's KV, and the private path is what knows how.
+    # `all` is a subset of this and had its own copy of the same body above -- two blocks to keep in agreement where the second already answered both.
     if any(len(prompt) >= request.max_gen_len for prompt, request in zip(
         prompts, requests, strict=True
     )):

@@ -120,7 +120,7 @@ class EagerLine:
         )
 
         state_rows, state_rows_host = session._active_state_rows(active)
-        active_rows = torch.tensor(active, device=session.device)
+        active_rows = session._active_rows_tensor(active)
         forbidden = session.forbidden.index_select(0, active_rows)
         sample_mask = session.sampling_mask.index_select(0, active_rows)
         seeds = session.sampling_seeds.index_select(0, active_rows)

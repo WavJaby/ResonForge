@@ -422,8 +422,17 @@ class ContinuousDecodeGraphRuntime:
         self,
         rows: tuple[int, ...],
         quantum: int,
+        state: dict[str, object] | None = None,
     ) -> int | None:
-        state = self._host_offset_state()
+        """The captured-graph bucket these rows fit in, or `None`.
+
+        `state` is the caller's already-resolved offset state. `replay` holds
+        one and passes it: resolving it is a linear scan over every layer, and
+        it used to run twice per replay -- once inside here, once again right
+        after -- for the same answer.
+        """
+        if state is None:
+            state = self._host_offset_state()
         if state is None:
             return None
         offsets = state["row_offsets_host"]
@@ -525,10 +534,10 @@ class ContinuousDecodeGraphRuntime:
             temporal_floors.shape != sampling_mask.shape
         ):
             self._reject("temporal-metadata-shape")
-        bucket_end = self._bucket_end(state_rows_host, quantum)
+        state = self._host_offset_state()
+        bucket_end = self._bucket_end(state_rows_host, quantum, state)
         if bucket_end is None:
             self._reject("kv-capacity")
-        state = self._host_offset_state()
         assert state is not None
         key = DecodeGraphKey(
             width=sequence.shape[0],

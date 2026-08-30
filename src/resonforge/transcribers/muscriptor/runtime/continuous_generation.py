@@ -398,6 +398,9 @@ class ContinuousGenerationBatch:
         self._state_rows: dict[
             tuple[int, ...], tuple[torch.Tensor, tuple[int, ...]]
         ] = {}
+        # `active` as a device tensor. Separate from `_state_rows` only because a CFG session's state rows are the active set PLUS its mirror,
+        # so the two tuples differ; with CFG off they are equal and this cache defers to that one rather than making a second copy of it.
+        self._active_rows: dict[tuple[int, ...], torch.Tensor] = {}
         # Graphs bind tensor addresses, but the physical slot selected for a
         # compact active cohort may change after pause/resume or replacement.
         # Keep one graph-owned row-index tensor per active width and update its
@@ -532,6 +535,7 @@ class ContinuousGenerationBatch:
         self.model_state.clear()
         self.conditions.clear()
         self._state_rows.clear()
+        self._active_rows.clear()
         self._graph_state_rows.clear()
         self._graph_state_row_values.clear()
         self._preempted.clear()
@@ -714,6 +718,7 @@ class ContinuousGenerationBatch:
 
         One search, because there were three: `can_resume` asked "is there any slot", the spill restore relocated, and `restore_preempted` installed into `handle.slot` regardless.
         The first two agreed and the third contradicted both -- `can_resume` said yes and the rebuild then raised `cannot replace an active slot` on a real run.
+        A fourth survived that collapse, inline in `admit_prepared`, spelled identically and never noticed -- which is the whole reason this docstring exists.
         """
         return next(
             (
@@ -1043,7 +1048,13 @@ class ContinuousGenerationBatch:
         if not tokens:
             return
         state_rows, state_rows_host = self._active_state_rows((slot_index,))
-        rows = torch.tensor((slot_index,), device=self.device)
+        rows = self._active_rows_tensor((slot_index,))
+        # Hoisted: one row, and none of these change across the replay. `EagerLine.launch` hoists exactly this set for the same reason; this path was still re-gathering them per token.
+        # `sequence` and `sampling_positions` stay inside -- both are written every step.
+        forbidden = self.forbidden.index_select(0, rows)
+        sample_mask = self.sampling_mask.index_select(0, rows)
+        seeds = self.sampling_seeds.index_select(0, rows)
+        floors = self.temporal_floors.index_select(0, rows)
         for token in tokens:
             grow_state_rows(self.model_state, state_rows_host, ahead=1)
             select_state_rows(
@@ -1060,22 +1071,20 @@ class ContinuousGenerationBatch:
                     top_k=0,
                     top_p=0.0,
                     cfg_coef=self.cfg_coef,
-                    forbidden_tokens=self.forbidden.index_select(0, rows),
-                    sample_mask=self.sampling_mask.index_select(0, rows),
+                    forbidden_tokens=forbidden,
+                    sample_mask=sample_mask,
                     generator=None,
-                    sampling_seeds=self.sampling_seeds.index_select(0, rows),
+                    sampling_seeds=seeds,
                     sampling_positions=self.sampling_positions.index_select(
                         0, rows
                     ),
                     trace_collectors=(None,),
                     trace_contexts=((),),
                     temporal_shift_values=self.temporal_shift_values,
-                    temporal_floors=self.temporal_floors.index_select(0, rows),
+                    temporal_floors=floors,
                 )
             self.sequence[slot_index, 0] = token
-            self.sampling_positions[rows] += self.sampling_mask.index_select(
-                0, rows
-            ).long()
+            self.sampling_positions[rows] += sample_mask.long()
             increment_state_rows(
                 self.lm.transformer,
                 self.model_state,
@@ -1295,15 +1304,7 @@ class ContinuousGenerationBatch:
 
     def admit_prepared(self, row: PreparedGenerationRow) -> bool:
         """Install an already-prefilled row into a compatible inactive slot."""
-        slot = next(
-            (
-                index
-                for index, candidate in enumerate(self.slots)
-                if candidate.row is None
-                and row.request.max_gen_len <= candidate.capacity
-            ),
-            None,
-        )
+        slot = self._free_slot_for(row)
         if slot is None:
             return False
         self.install(slot, row)
@@ -1377,6 +1378,7 @@ class ContinuousGenerationBatch:
         # fixed-width tensor is built at the wrong count.
         self.model_state = None
         self._state_rows.clear()
+        self._active_rows.clear()
         self._cuda_graph_runtime = None
         if on_released is not None:
             funded = on_released(width)
@@ -1739,6 +1741,21 @@ class ContinuousGenerationBatch:
         self._state_rows[active] = cached
         return cached
 
+    def _active_rows_tensor(self, active: tuple[int, ...]) -> torch.Tensor:
+        """`active` on the device, cached on the tuple.
+
+        Three sites built this by hand -- the graph launch, the graph consume and the eager launch -- so one quantum paid three H2D copies for one unchanging index set.
+        Read-only at every use: nothing writes into the returned tensor.
+        """
+        if not self.cfg_enabled:
+            # No mirror rows => `_active_state_rows` builds exactly this tuple.
+            return self._active_state_rows(active)[0]
+        cached = self._active_rows.get(active)
+        if cached is None:
+            cached = torch.tensor(active, dtype=torch.long, device=self.device)
+            self._active_rows[active] = cached
+        return cached
+
     def _graph_state_rows_for(
         self,
         state_rows: torch.Tensor,
@@ -1781,7 +1798,7 @@ class ContinuousGenerationBatch:
             graph_state_rows,
             host_rows=state_rows_host,
         )
-        active_rows = torch.tensor(active, device=self.device)
+        active_rows = self._active_rows_tensor(active)
         # The only phase in this file whose stream-elapsed time IS device time.
         # Everywhere else a `_CudaPhaseRecorder` pair brackets a region the host participates in, so the stream drains between launches and the reading is the region's wall clock over again -- same interval, measured twice.
         # A graph replay needs no host participation once enqueued, so between these two events the stream runs the graph and nothing else.
@@ -1907,7 +1924,7 @@ class ContinuousGenerationBatch:
                     )
                     break
             next_sequences.append(row.last_token if row is not None else 0)
-        active_rows = torch.tensor(active, device=self.device)
+        active_rows = self._active_rows_tensor(active)
         self.sequence[active_rows, 0] = torch.tensor(
             next_sequences,
             device=self.device,

@@ -46,6 +46,7 @@ from resonforge.scheduler.liveness.scheduler import (
     SchedulerState,
     enabled_actions,
     external_waits_cover_state,
+    run_owner_free,
     validate_scheduler_state,
 )
 from resonforge.scheduler.model_types import (
@@ -4336,27 +4337,17 @@ class ModelWorkerPool(Generic[_ModelT]):
 
     @staticmethod
     def _run_session_owner_free(state: SchedulerRunState) -> bool:
-        return state.session_exists and not any(
-            (
-                state.controls,
-                state.prefill,
-                state.in_flight,
-                state.tracked,
-                state.active,
-                state.occupied,
-                state.resident_handles,
-                state.control_intents,
-                state.producer_waits,
-                state.bundle_owned_handles,
-            )
-        )
+        return run_owner_free(state)
 
     @staticmethod
     def _run_owner_free(run: _PersistentRun[_ModelT]) -> bool:
         """A resident lane holding nothing -- the only state a resize is legal in.
 
-        Direct reading of `_run_session_owner_free`, which asks the same of an assembled `SchedulerRunState`.
-        Assembling one costs a device query per run per turn, and this is asked of every run every turn.
+        Same question as `run_owner_free`, read straight off the run: assembling a `SchedulerRunState` costs a device query per run per turn, and this is asked of every run every turn.
+        The two must not disagree, so here is why the shorter list is the SAME list -- five of the assembled fields are implied, and none of them is dropped by choice:
+          active <= occupied; control_intents is built from `pending_controls`;
+          producer_waits and bundle_owned_handles are both proven subsets of `resident_handles_by_key` by invariants asserted where the snapshot is built.
+        `tracked` is implied by nothing, was missing, and is the one field this predicate used to be looser by.
         """
         session = run.session
         return session is not None and not (
@@ -4365,6 +4356,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             or run.in_flight
             or run.pending_controls
             or run.resident_handles_by_key
+            or run.active_by_item
         )
 
     def _run_affordable_bound(
@@ -4516,7 +4508,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         Width is re-derived against `pool`, not read off `run.width`: that value was resolved before any co-resident lane opened,
         and a run pinned to it stays unadmittable forever once the device fills -- the only place that narrows it is the session creation admission refuses to reach.
         """
-        cost = run.arena_cost
+        cost = self._effective_cost(run)
         if cost is None:
             return 0
         credits = self._own_credits(run)
@@ -4528,7 +4520,10 @@ class ModelWorkerPool(Generic[_ModelT]):
         )
         if width < cost.minimum_width:
             return None
-        needed = blocks_for(max(cost.row_bytes, run.measured_row_bytes) * width)
+        # Width at the EFFECTIVE price, blocks at the RAW one, exactly as `_run_affordable_bound` and `_run_demand_width` pair them:
+        # the transient is a peak a decode step reaches, not bytes the arena allocates, so it bounds how wide a lane may go and is never charged as arena.
+        # This site solved the width at the raw price while the resize path solved it at the effective one -- the same lane priced two ways by two admission routes.
+        needed = self._arena_blocks(run, width)
         return (
             needed
             if pool.admits(needed, **credits)
