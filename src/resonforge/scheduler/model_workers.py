@@ -7,7 +7,6 @@ import gc
 import itertools
 import logging
 import math
-import os
 import queue
 import sys
 import threading
@@ -737,12 +736,6 @@ class ModelWorkerPool(Generic[_ModelT]):
         ] = set()
         self._recent_transitions: list[dict[str, object]] = []
         self._last_decode_quantum_finished_at: float | None = None
-        # S5c host-async decode (docs/mixed-batch/PLAN.md): the decode action
-        # launches a replay and consumes it on the NEXT decode dispatch, so the
-        # scheduler's own work between the two runs beside the device instead
-        # of after it. Off by default until the A/B lands; the toggle is
-        # temporary and is removed with the measurement either way.
-        self._async_decode = os.environ.get("RESONFORGE_ASYNC_DECODE", "") == "1"
         self._liveness_error: SchedulerLivenessError | None = None
         self._requested_terminal_error: BaseException | None = None
         self._producer_waits: dict[tuple[int, int, int], _ProducerDecisionWait] = {}
@@ -2902,8 +2895,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         try:
             # S5c: every non-decode action may mutate slots, pages or arenas,
             # so every in-flight quantum on this device is consumed first --
-            # decode consumes its own run's inline. A no-op while nothing is
-            # in flight, which is always the case with async decode off.
+            # decode consumes its own run's inline.
             if action != "decode":
                 # Over a copy: publishing a drained completion can submit
                 # follow-up work and create a run in the live dict mid-loop.
@@ -3207,9 +3199,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                     decode_started - self._last_decode_quantum_finished_at,
                 )
                 run.stats.scheduler_boundary_gap_count += 1
-            if self._async_decode and getattr(
-                session, "split_decode_supported", False
-            ):
+            if getattr(session, "split_decode_supported", False):
                 # S5c: consume the previous launch's tokens (a full sync), then
                 # launch the next replay and return while it runs -- the
                 # scheduler's decision work and the other lane's dispatches
