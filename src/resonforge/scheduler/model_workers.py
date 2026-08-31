@@ -1511,13 +1511,8 @@ class ModelWorkerPool(Generic[_ModelT]):
             )
         self._producer_waits[wait.handle_key] = wait
         run.scheduler_observations["producer_decision_wait_registered"] += 1
-        run.scheduler_observations["producer_decision_waits_peak"] = max(
-            run.scheduler_observations["producer_decision_waits_peak"],
-            sum(
-                candidate.run_identity == id(run)
-                for candidate in self._producer_waits.values()
-            ),
-        )
+        # No second peak here. `run_metadata.py` already takes the max of per-job `producer_decision_waits_outstanding`, the same quantity by the correct route;
+        # this copy computed it into the SUMMED bag, so the two disagreed by however many jobs looked (R18).
 
     def _record_dependency_bundle_completion(
         self,
@@ -4114,22 +4109,17 @@ class ModelWorkerPool(Generic[_ModelT]):
             subject.scheduler_observations["pool_transient_unmeasured_width"] += 1
         # The counter above counts *readings* at an unmeasured width, and a reading binds nothing -- a width is chosen a handful of times a run, the price is read tens of thousands.
         # `pool_width_decisions` counts the DECISIONS, and is the responsiveness witness: it read 0 for weeks because they landed on a second pool instance for the same card.
-        # Set, not accumulated: the pool owns the running totals and these observations are summed across jobs.
-        report = pool.bootstrap_pricing_report()
-        subject.scheduler_observations["pool_width_decisions"] = int(
-            report["width_decisions"]
-        )
+        # Gauges, because the pool owns the running totals: assigning them into the counter bag only avoided multiplying by the JOB count, and they were still summed across the runs of an arm (R18).
         # `diverged` is the answer the decision counter can only pose: declarations where pricing from measurements would have chosen a DIFFERENT width.
         # diverged==0 with outcomes>0 is the real "harmless" reading.
-        subject.scheduler_observations["pool_width_outcomes"] = int(
-            report["width_outcomes"]
-        )
-        subject.scheduler_observations["pool_width_outcomes_diverged"] = int(
-            report["width_outcomes_diverged"]
-        )
-        subject.scheduler_observations["pool_width_outcome_worst_blocks"] = int(
-            report["width_outcome_worst_blocks"]
-        )
+        report = pool.bootstrap_pricing_report()
+        for name in (
+            "width_decisions",
+            "width_outcomes",
+            "width_outcomes_diverged",
+            "width_outcome_worst_blocks",
+        ):
+            self._observe_device_gauge(subject, f"pool_{name}", int(report[name]))
         # How often a row couldn't be given a page + by how much the supply fell short -- the measurement that would justify declaring a larger one.
         # Delta against this worker's own baseline: these observations are summed across jobs and the source is a running total.
         events, blocks_short = _kv_pool_shortfall_totals(device)
@@ -4947,12 +4937,12 @@ class ModelWorkerPool(Generic[_ModelT]):
         run.width = self._resolve_arena_width(run)
         run.capacity_resolved = True
         run.scheduler_observations["capacity_prepare_actions"] += 1
-        run.scheduler_observations["arena_row_bytes"] = cost.row_bytes
-        run.scheduler_observations["arena_pool_width"] = run.width
+        self._observe_lane_gauge(run, "arena_row_bytes", cost.row_bytes)
+        self._observe_lane_gauge(run, "arena_pool_width", run.width)
         # P4's verdict is NOT recorded here. Capacity preparation runs at t=0, before this lane has seen work, so a high-water read now is always its starting value
         # -- measured at 1 for a lane that went on to want 13. It goes in the per-turn histogram instead.
-        run.scheduler_observations["arena_lane_maximum_width"] = (
-            cost.maximum_width or 0
+        self._observe_lane_gauge(
+            run, "arena_lane_maximum_width", cost.maximum_width or 0
         )
         # What the arena was solved against, beside what it resolved to. A pool sized from arena demand has to know whether the width came out at the device's limit or the lane's ceiling:
         # only in the first case does "everything available" equal "no greedier than the arenas would have been". Indistinguishable from `arena_pool_width` alone => measured, not argued.
@@ -4972,10 +4962,13 @@ class ModelWorkerPool(Generic[_ModelT]):
             funded = self._declare_kv_rows(run, model, run.width)
             if funded is not None and funded >= 1:
                 run.width = min(run.width, funded)
-        run.scheduler_observations["arena_available_blocks"] = (
+        # Lane-keyed although the pool belongs to the device: what this answers is what was free when THIS lane opened, and two lanes open at different moments.
+        self._observe_lane_gauge(
+            run,
+            "arena_available_blocks",
             self._live_pool_view(run.key.device).available_blocks(
                 **self._own_credits(run)
-            )
+            ),
         )
 
     def _declare_kv_rows(
@@ -5007,7 +5000,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         declared_bytes = int(
             declare(model, wanted, run.capacity, run.key.model, role, run.key.device)
         )
-        run.scheduler_observations["kv_pool_declared_bytes"] = declared_bytes
+        self._observe_lane_gauge(run, "kv_pool_declared_bytes", declared_bytes)
         row_bytes = _kv_lane_row_bytes(run.key.device, run.key.model)
         if row_bytes < 1:
             return None
@@ -5171,6 +5164,36 @@ class ModelWorkerPool(Generic[_ModelT]):
         value: int,
     ) -> None:
         run.stats.scheduler_state_histograms.setdefault(name, Counter())[int(value)] += 1
+
+    @staticmethod
+    def _observe_lane_gauge(
+        run: _PersistentRun[_ModelT],
+        name: str,
+        value: int,
+    ) -> None:
+        """A LEVEL that belongs to one lane -- a width, a price, a declaration.
+
+        Not `scheduler_observations`: that bag is SUMMED, across the lanes of a
+        run and again across the runs of an arm, and a level summed is not that
+        level. `arena_pool_width` read a stable 54 through a whole A/B because
+        one lane at 54 and two lanes at 31 + 23 are the same number (R18).
+        Keyed by lane so the gauge aggregation -- `max` per name, in
+        `run_metadata.py` -- runs per lane instead of across them.
+        """
+        run.stats.scheduler_gauges[f"{name}:{run.key.model}"] = int(value)
+
+    @staticmethod
+    def _observe_device_gauge(
+        run: _PersistentRun[_ModelT],
+        name: str,
+        value: int,
+    ) -> None:
+        """A LEVEL that belongs to the device, recorded against one run of it.
+
+        Unkeyed: every lane on the device would report the same reading, and
+        `max` is the aggregation that survives two of them doing so.
+        """
+        run.stats.scheduler_gauges[name] = int(value)
 
     def _record_scheduler_snapshot(
         self,
