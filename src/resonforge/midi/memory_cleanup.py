@@ -9,7 +9,6 @@ import librosa
 import numpy as np
 
 from ..audio.buffer import AudioBuffer
-from .cleanup import _beat_grid, _support_ratio
 from .intervals import Note
 
 
@@ -48,6 +47,46 @@ def _onset_times(audio: AudioBuffer, sample_rate: int = 22_050) -> np.ndarray:
         backtrack=False,
     )
     return librosa.frames_to_time(frames, sr=sample_rate, hop_length=256)
+
+
+def _support_ratio(
+    query: Iterable[float],
+    reference: np.ndarray,
+    tolerance: float,
+) -> float:
+    """Share of query times with a reference time within `tolerance`."""
+    query_array = np.asarray(list(query), dtype=float)
+    if query_array.size == 0 or reference.size == 0:
+        return 0.0
+    indices = np.searchsorted(reference, query_array)
+    supported = 0
+    for query_time, index in zip(query_array, indices, strict=True):
+        distances = []
+        if index < reference.size:
+            distances.append(abs(float(reference[index]) - query_time))
+        if index:
+            distances.append(abs(float(reference[index - 1]) - query_time))
+        supported += bool(distances and min(distances) <= tolerance)
+    return supported / query_array.size
+
+
+def _beat_grid(beat_times: Iterable[float]) -> np.ndarray:
+    """Expand quarter-note beats to common binary and triplet subdivisions."""
+    beats = np.asarray(list(beat_times), dtype=float)
+    if beats.size < 2:
+        return beats
+    points = list(beats)
+    for left, right in zip(beats, beats[1:], strict=False):
+        interval = right - left
+        if interval <= 0:
+            continue
+        for denominator in (2, 3, 4):
+            points.extend(
+                left + interval * numerator / denominator
+                for numerator in range(1, denominator)
+            )
+    return np.asarray(sorted(set(points)), dtype=float)
+
 
 
 @dataclass(frozen=True)
