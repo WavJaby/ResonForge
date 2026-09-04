@@ -512,6 +512,12 @@ class _ResumableSession(Protocol):
 
     def discard(self, handle: object) -> object: ...
 
+    #: The outcome to publish for a control action this session executed. The
+    #: scheduler decides *that* a row is discarded; the result type saying so
+    #: belongs to the backend, and building one here is what made the
+    #: scheduler import its transcriber.
+    def control_outcome(self, *, discarded: bool) -> object: ...
+
     def can_resume(self, handle: object) -> bool: ...
 
     def preempt_for_admission(self) -> bool: ...
@@ -2732,23 +2738,15 @@ class ModelWorkerPool(Generic[_ModelT]):
             terminal=action == "discard",
         )
         if action == "discard":
-            from resonforge.transcribers.muscriptor.quality.generation_batch import (
-                GenerationControlResult,
-            )
-
             run.session.discard(handle)
             run.resident_handles_by_key.pop(handle_key, None)
             self._complete_inherited_claim_control(task, None)
             self._refresh_capacity_measurement(run)
             if was_displaced:
                 run.scheduler_observations["displaced_row_discards"] += 1
-            task.future.set_result(GenerationControlResult(discarded=True))
-            self._record_persistent_timing(
-                run,
-                task,
-                False,
-                result=GenerationControlResult(discarded=True),
-            )
+            outcome = run.session.control_outcome(discarded=True)
+            task.future.set_result(outcome)
+            self._record_persistent_timing(run, task, False, result=outcome)
             self._record_waterfall_event(
                 run,
                 "discard",

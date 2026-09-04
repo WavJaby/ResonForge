@@ -28,6 +28,7 @@ from muscriptor.modules.streaming import (
 )
 
 from resonforge.transcribers.muscriptor.quality.generation_batch import (
+    GenerationControlResult,
     GenerationRequest,
     GenerationResult,
 )
@@ -1175,6 +1176,10 @@ class ContinuousGenerationBatch:
         slot.paused = False
         assert slot.row is not None
         return slot.row.request
+
+    def control_outcome(self, *, discarded: bool) -> GenerationControlResult:
+        """The result the scheduler publishes for a control action here."""
+        return GenerationControlResult(discarded=discarded)
 
     def discard(self, handle: GenerationHandle) -> GenerationRequest:
         """Release a paused row and invalidate its handle.
