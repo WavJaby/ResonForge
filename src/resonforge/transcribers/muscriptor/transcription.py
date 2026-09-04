@@ -57,6 +57,7 @@ from resonforge.transcribers.muscriptor.execution_profile import (
     MuscriptorExecutionProfile,
     resolve_muscriptor_execution_profile,
 )
+from resonforge.transcribers.muscriptor.quality_plan import MuscriptorQualityPlan
 from resonforge.transcribers.muscriptor.region_producer import (
     ProducerHandoff,
     RegionProducerSession,
@@ -1020,6 +1021,29 @@ def _transcribe_scheduled(
         worker_dtype: str,
         region_order: int,
     ) -> RegionProducerSession:
+        plan = MuscriptorQualityPlan(
+            anomaly_detection=args.muscriptor_anomaly_detection,
+            overlap_detection=args.muscriptor_overlap_detection,
+            recovery=args.muscriptor_recovery,
+            recovery_shift_seconds=RECOVERY_SHIFT_SECONDS,
+            recovery_seed=RECOVERY_SEED,
+            replay_seconds=REPLAY_SECONDS,
+            min_verify_seconds=MIN_VERIFY_SECONDS,
+            checkpoint_generation=True,
+            fresh_reanchor=args.muscriptor_fresh_reanchor,
+            first_chunk_model=bootstrap_model_name,
+            fresh_reanchor_model=fresh_reanchor_model_name,
+            chunk_quality_history=chunk_quality_history,
+            hard_pitch_envelope=(
+                None
+                if task.name in {"other", "drums"}
+                else DEFAULT_HARD_PITCH_ENVELOPE
+            ),
+            trace_collector=trace_collector,
+            trace_context_prefix=(export_key, task.name, region_order),
+            overlap_probe="overlap-probe" in args.debug_capture,
+        )
+
         def create_events(model_obj: object) -> Iterator[object]:
             return iter(
                 model_obj.transcribe(
@@ -1029,33 +1053,9 @@ def _transcribe_scheduled(
                     batch_size=1,
                     no_eos_is_ok=True,
                     prelude_forcing=prelude_forcing,
-                    anomaly_detection=args.muscriptor_anomaly_detection,
-                    overlap_detection=args.muscriptor_overlap_detection,
-                    recovery=args.muscriptor_recovery,
-                    _recovery_shift_seconds=RECOVERY_SHIFT_SECONDS,
-                    recovery_seed=RECOVERY_SEED,
-                    replay_seconds=REPLAY_SECONDS,
-                    min_verify_seconds=MIN_VERIFY_SECONDS,
+                    plan=plan,
                     stdout_logger=logs.stdout_logger,
                     stderr_logger=logs.stderr_logger,
-                    _defer_generation=True,
-                    _checkpoint_generation=True,
-                    _trace_collector=trace_collector,
-                    _trace_context_prefix=(
-                        export_key,
-                        task.name,
-                        region_order,
-                    ),
-                    _first_chunk_model=bootstrap_model_name,
-                    _fresh_reanchor_model=fresh_reanchor_model_name,
-                    _fresh_reanchor=args.muscriptor_fresh_reanchor,
-                    _chunk_quality_history=chunk_quality_history,
-                    _hard_pitch_envelope=(
-                        None
-                        if task.name in {"other", "drums"}
-                        else DEFAULT_HARD_PITCH_ENVELOPE
-                    ),
-                    _overlap_probe="overlap-probe" in args.debug_capture,
                 )
             )
 
