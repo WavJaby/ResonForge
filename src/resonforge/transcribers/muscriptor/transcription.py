@@ -225,7 +225,7 @@ def _prepare_recovery_continuous_work(
     requests: tuple[object, ...],
 ) -> tuple[PreparedWorkItem, ...]:
     """Build recovery session rows and retain role-specific result adapters."""
-    from muscriptor.recovery_runtime import (
+    from resonforge.transcribers.muscriptor.quality.recovery_runtime import (
         complete_recovery_candidate,
         prepare_recovery_candidates,
     )
@@ -625,10 +625,19 @@ def output_path(task: StemTask, out_dir: Path) -> Path:
 def _event_to_jsonl(event: object) -> dict[str, object] | None:
     """Convert one event into the CLI-style JSONL shape."""
     from muscriptor.events import NoteEndEvent, NoteStartEvent
-    from muscriptor.generation_anomaly import GenerationAnomalyEvent
-    from muscriptor.overlap import OverlapDiagnosticsEvent
-    from muscriptor.recovery import RecoveryDiagnosticsEvent
-    from muscriptor.recovery_runtime import FirstChunkBootstrapEvent
+
+    from resonforge.transcribers.muscriptor.quality.generation_anomaly import (
+        GenerationAnomalyEvent,
+    )
+    from resonforge.transcribers.muscriptor.quality.overlap import (
+        OverlapDiagnosticsEvent,
+    )
+    from resonforge.transcribers.muscriptor.quality.recovery import (
+        RecoveryDiagnosticsEvent,
+    )
+    from resonforge.transcribers.muscriptor.quality.recovery_runtime import (
+        FirstChunkBootstrapEvent,
+    )
 
     if isinstance(event, NoteStartEvent):
         return {"type": "start", **dataclasses.asdict(event)}
@@ -1002,11 +1011,13 @@ def _transcribe_scheduled(
         recovery_model_name,
         bootstrap_model_name,
     )
-    from muscriptor.chunk_quality import (
+    from resonforge.transcribers.muscriptor.quality.chunk_quality import (
         DEFAULT_ADAPTIVE_CHUNK_QUALITY_CONFIG,
         ChunkQualityHistory,
     )
-    from muscriptor.generation_guard import DEFAULT_HARD_PITCH_ENVELOPE
+    from resonforge.transcribers.muscriptor.quality.generation_guard import (
+        DEFAULT_HARD_PITCH_ENVELOPE,
+    )
 
     chunk_quality_history = ChunkQualityHistory(
         DEFAULT_ADAPTIVE_CHUNK_QUALITY_CONFIG.history_size
@@ -1249,14 +1260,13 @@ def _transcribe_scheduled(
                     payloads_by_region[index].extend(step.payloads)
                     report_completed(step.completed_delta)
                     if step.generation_request is not None:
-                        from muscriptor.generation_batch import (
+                        from resonforge.transcribers.muscriptor.quality.generation_batch import (
                             GenerationControlRequest,
                         )
-                        from muscriptor.recovery_runtime import (
+                        from resonforge.transcribers.muscriptor.quality.recovery_runtime import (
                             RecoveryCandidateGroupRequest,
                             RecoveryCandidateSpec,
                         )
-
                         from resonforge.transcribers.muscriptor.runtime.continuous_generation import (
                             condition_batch_key,
                         )

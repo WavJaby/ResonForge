@@ -61,11 +61,12 @@ class RegionProducerSession:
     def advance(self) -> RegionStep:
         """Consume one model result and stop at the next scheduling boundary."""
         from muscriptor.events import ProgressEvent
-        from muscriptor.generation_batch import (
+
+        from resonforge.transcribers.muscriptor.quality.generation_batch import (
             GenerationControlRequest,
             GenerationRequest,
         )
-        from muscriptor.recovery_runtime import (
+        from resonforge.transcribers.muscriptor.quality.recovery_runtime import (
             RecoveryCandidateGroupRequest,
             RecoveryCandidateSpec,
         )

@@ -2732,7 +2732,9 @@ class ModelWorkerPool(Generic[_ModelT]):
             terminal=action == "discard",
         )
         if action == "discard":
-            from muscriptor.generation_batch import GenerationControlResult
+            from resonforge.transcribers.muscriptor.quality.generation_batch import (
+                GenerationControlResult,
+            )
 
             run.session.discard(handle)
             run.resident_handles_by_key.pop(handle_key, None)

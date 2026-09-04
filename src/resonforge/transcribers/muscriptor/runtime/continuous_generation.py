@@ -11,10 +11,6 @@ from dataclasses import dataclass
 from itertools import count
 
 import torch
-from muscriptor.generation_batch import GenerationRequest, GenerationResult
-from muscriptor.generation_guard import (
-    GuardFinding,
-)
 from muscriptor.modules.cuda_contiguous_attention import check_block_table_fault
 from muscriptor.modules.paged_kv import (
     KVPagesExhausted,
@@ -31,6 +27,13 @@ from muscriptor.modules.streaming import (
     select_state_rows,
 )
 
+from resonforge.transcribers.muscriptor.quality.generation_batch import (
+    GenerationRequest,
+    GenerationResult,
+)
+from resonforge.transcribers.muscriptor.quality.generation_guard import (
+    GuardFinding,
+)
 from resonforge.transcribers.muscriptor.runtime.decode.graphs import (
     ContinuousDecodeGraphRuntime,
 )

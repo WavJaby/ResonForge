@@ -13,16 +13,20 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 import torch
-from muscriptor.generation_batch import GenerationRequest
-from muscriptor.generation_guard import (
+from muscriptor.modules.streaming import ModelState
+
+from resonforge.transcribers.muscriptor.quality.generation_batch import (
+    GenerationRequest,
+)
+from resonforge.transcribers.muscriptor.quality.generation_guard import (
     GenerationCompleted,
     GenerationGuard,
     GuardFinding,
     TokenBatchObserved,
 )
-from muscriptor.generation_position import GenerationPosition
-from muscriptor.modules.streaming import ModelState
-
+from resonforge.transcribers.muscriptor.quality.generation_position import (
+    GenerationPosition,
+)
 from resonforge.transcribers.muscriptor.runtime.prefill import (
     memory as prefill_memory,
 )

@@ -14,9 +14,11 @@ from collections.abc import Callable
 from contextlib import nullcontext
 
 import torch
-from muscriptor.generation_batch import GenerationRequest
 from muscriptor.modules.streaming import ModelState, increment_steps
 
+from resonforge.transcribers.muscriptor.quality.generation_batch import (
+    GenerationRequest,
+)
 from resonforge.transcribers.muscriptor.runtime.generation_state import (
     slot_state_row_indices,
 )
