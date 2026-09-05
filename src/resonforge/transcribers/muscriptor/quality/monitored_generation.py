@@ -12,7 +12,6 @@ from muscriptor.tokenizer.notes import Event
 from resonforge.transcribers.muscriptor.quality.generation_anomaly import (
     DEFAULT_ANOMALY_CONFIG,
     AnomalyMonitorConfig,
-    MonitorSummary,
 )
 from resonforge.transcribers.muscriptor.quality.generation_guard import (
     GenerationGuard,
@@ -20,6 +19,7 @@ from resonforge.transcribers.muscriptor.quality.generation_guard import (
     GuardDecision,
     TokenBatchObserved,
 )
+from resonforge.transcribers.muscriptor.quality.guard_protocol import MonitorSummary
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,7 @@ class MonitoredGeneration(Iterator[MonitoredToken]):
         self._step_sources.append(iter(steps))
 
     def finalize(self) -> MonitorSummary:
-        summary = self._summary or self._guard.anomaly_summary(self.ended)
+        summary = self._summary or self._guard.summary(self.ended)
         assert summary is not None
         return summary
 

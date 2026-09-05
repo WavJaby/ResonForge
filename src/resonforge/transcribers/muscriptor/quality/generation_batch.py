@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -9,11 +10,11 @@ from muscriptor.model_trace import ModelTraceCollector
 from muscriptor.modules.conditioners import ConditioningAttributes
 from muscriptor.tokenizer.notes import Event
 
-from resonforge.transcribers.muscriptor.quality.generation_anomaly import MonitorSummary
-from resonforge.transcribers.muscriptor.quality.generation_guard import (
-    GenerationGuardConfig,
+from resonforge.transcribers.muscriptor.quality.guard_protocol import (
     GuardAction,
     GuardFinding,
+    MonitorSummary,
+    RowGuard,
 )
 
 
@@ -114,8 +115,12 @@ class GenerationRequest:
     trace_collector: ModelTraceCollector | None = None
     trace_context: tuple[object, ...] = ()
     sampling_seed: int | None = None
-    guard_config: GenerationGuardConfig | None = None
-    guard_vocab: tuple[Event, ...] = ()
+    #: Builds the guard the decode loop feeds this row's tokens to. A factory, not an instance: the guard is stateful and the executor, not the policy, decides when the row exists. `None` = unguarded.
+    guard: Callable[[], RowGuard] | None = None
+    #: Whether the guard may leave the row resident -- paused for verification or interrupted into recovery -- instead of finishing it. Admission credits a checkpoint dependency for such a row; a guard that only ever rejects terminally earns none.
+    guard_may_pause: bool = False
+    #: What the row reports when musical time regresses. The decode loop enforces the floor itself (fail-closed, O2); the policy only names the consequence.
+    on_temporal_regression: GuardAction = "interrupt_to_recovery"
     temporal_grammar: TemporalGrammarConfig | None = None
     recovery_group_claim: RecoveryGroupClaim | None = None
 
@@ -157,11 +162,11 @@ class GenerationRequest:
     @property
     def requires_dependency_credit(self) -> bool:
         """Whether admission can create a resident checkpoint dependency."""
-        return bool(self.checkpoint_token_ids) or (
-            self.guard_config is not None
-            and self.guard_config.mode == "recovery"
-            and self.guard_config.role != "fresh"
-        ) or self.recovery_group_claim is not None
+        return (
+            bool(self.checkpoint_token_ids)
+            or self.guard_may_pause
+            or self.recovery_group_claim is not None
+        )
 
     @property
     def initial_kv_capacity_bucket(self) -> int:
@@ -245,13 +250,9 @@ class RecoveryCandidateSpec:
     derivation (`checkpoint_shift_tokens`) and scheduler protocol the primary
     chunk uses. The envelope is what actually differs between a candidate and
     a primary chunk: where it runs (`target_model` / `model_role`) and how the
-    completed row is validated (`candidate_name`, the frame-rate check, margin
-    collection). The scheduler-facing properties delegate, so a spec submits
-    exactly like the request it carries.
-    Replaces `RecoveryCandidateRequest`, which duplicated fourteen request
-    fields and six property implementations under second names
-    (`expected_vocab` = `guard_vocab`, `expected_eos_id` = `eos_id`,
-    `verify_shift_value` -> `checkpoint_token_ids`).
+    completed row is validated (`candidate_name`, the frame-rate and vocabulary
+    checks, margin collection). The scheduler-facing properties delegate, so a
+    spec submits exactly like the request it carries.
     """
 
     candidate_name: Literal[
@@ -263,6 +264,8 @@ class RecoveryCandidateSpec:
     ]
     request: GenerationRequest
     expected_frame_rate: int
+    #: The vocabulary the prompt and checkpoint were derived against; a recovery model with another one cannot execute this row.
+    expected_vocab: tuple[Event, ...]
     target_model: str | None = None
     model_role: Literal["primary", "recovery"] = "recovery"
     collect_shift_margins: bool = False

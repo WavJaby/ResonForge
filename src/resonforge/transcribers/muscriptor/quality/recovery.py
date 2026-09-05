@@ -14,10 +14,10 @@ from resonforge.transcribers.muscriptor.quality.chunk_quality import (
     AdaptiveChunkQualityAssessment,
     ChunkQualityMetrics,
 )
-from resonforge.transcribers.muscriptor.quality.generation_guard import GuardFinding
 from resonforge.transcribers.muscriptor.quality.generation_position import (
     GenerationPosition,
 )
+from resonforge.transcribers.muscriptor.quality.guard_protocol import GuardFinding
 from resonforge.transcribers.muscriptor.quality.overlap import OverlapMatch
 
 RecoveryCandidateName = Literal[

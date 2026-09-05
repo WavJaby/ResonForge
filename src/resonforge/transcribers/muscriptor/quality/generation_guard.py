@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from muscriptor.tokenizer.notes import Event
@@ -18,27 +19,21 @@ from resonforge.transcribers.muscriptor.quality.chunk_quality import (
 )
 from resonforge.transcribers.muscriptor.quality.generation_anomaly import (
     DEFAULT_ANOMALY_CONFIG,
-    AnomalyMetrics,
     AnomalyMode,
     AnomalyMonitorConfig,
-    MonitorSummary,
     RollingAnomalyMonitor,
 )
 from resonforge.transcribers.muscriptor.quality.generation_position import (
     GenerationPosition,
 )
+from resonforge.transcribers.muscriptor.quality.guard_protocol import (
+    AnomalyMetrics,
+    GuardAction,
+    GuardFinding,
+    MonitorSummary,
+)
 
 GuardRole = Literal["primary", "recovery", "fresh"]
-GuardStatus = Literal["clear", "warning", "critical"]
-GuardAction = Literal[
-    "continue",
-    "pause_for_verify",
-    "interrupt_to_recovery",
-    "reject_candidate",
-    "reject_terminal",
-    "accept_candidate",
-    "request_recovery",
-]
 
 
 @dataclass(frozen=True)
@@ -87,19 +82,6 @@ class ChunkQualityReady:
 GuardEvent = (
     TokenBatchObserved | VerifyReady | GenerationCompleted | ChunkQualityReady
 )
-
-
-@dataclass(frozen=True)
-class GuardFinding:
-    detector: str
-    status: GuardStatus
-    reason: str
-    metrics: dict[str, float | int | bool | str | None] = field(
-        default_factory=dict
-    )
-    observed_at: GenerationPosition | None = None
-    suspected_start: GenerationPosition | None = None
-    last_safe_frontier: GenerationPosition | None = None
 
 
 @dataclass(frozen=True)
@@ -458,6 +440,31 @@ class RestartChainCollapseDetector:
         )
 
 
+def row_guard_fields(
+    config: GenerationGuardConfig,
+    vocab: Sequence[Event],
+) -> dict[str, object]:
+    """The `GenerationRequest` fields one guard config decides.
+
+    Composed here, on the policy side, so the executor's contract never
+    names a mode or a role: it gets a factory, whether the row may pause,
+    and what to report on a temporal regression.
+    """
+    return {
+        "guard": (
+            None
+            if config.mode == "off" or not vocab
+            else lambda: GenerationGuard(config, vocab=vocab)
+        ),
+        "guard_may_pause": config.mode == "recovery" and config.role != "fresh",
+        "on_temporal_regression": (
+            "interrupt_to_recovery"
+            if config.role == "primary"
+            else "reject_candidate"
+        ),
+    }
+
+
 class GenerationGuard:
     """Fan out events to detectors, then map findings through role policy."""
 
@@ -465,8 +472,11 @@ class GenerationGuard:
         self,
         config: GenerationGuardConfig,
         detectors: tuple[GuardDetector, ...] | None = None,
+        *,
+        vocab: Sequence[Event] = (),
     ) -> None:
         self.config = config
+        self._vocab = vocab
         self.detectors = detectors or (
             RollingAnomalyDetector(config),
             OverlapVerificationDetector(config),
@@ -490,7 +500,20 @@ class GenerationGuard:
         self.findings.extend(fresh)
         return GuardDecision(self._action(event, fresh), fresh)
 
-    def anomaly_summary(self, emitted_eos: bool) -> MonitorSummary | None:
+    # -- RowGuard, the executor's view ------------------------------------
+    def observe(self, tokens: Sequence[int]) -> GuardAction:
+        vocab = self._vocab
+        events = tuple(vocab[token] for token in tokens if 0 <= token < len(vocab))
+        if not events:
+            return "continue"
+        return self.dispatch(TokenBatchObserved(events)).action
+
+    def complete(self, *, emitted_eos: bool, reached_max_length: bool) -> GuardAction:
+        return self.dispatch(
+            GenerationCompleted(emitted_eos, reached_max_length)
+        ).action
+
+    def summary(self, emitted_eos: bool) -> MonitorSummary | None:
         detector = next(
             (
                 detector

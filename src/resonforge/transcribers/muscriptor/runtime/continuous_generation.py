@@ -32,7 +32,7 @@ from resonforge.transcribers.muscriptor.quality.generation_batch import (
     GenerationRequest,
     GenerationResult,
 )
-from resonforge.transcribers.muscriptor.quality.generation_guard import (
+from resonforge.transcribers.muscriptor.quality.guard_protocol import (
     GuardFinding,
 )
 from resonforge.transcribers.muscriptor.runtime.decode.graphs import (
@@ -1225,7 +1225,7 @@ class ContinuousGenerationBatch:
         return (
             None
             if row.guard is None
-            else row.guard.anomaly_summary(row.emitted_eos)
+            else row.guard.summary(row.emitted_eos)
         )
 
     def _observe_guard_token(self, slot: _Slot, token: int) -> str:

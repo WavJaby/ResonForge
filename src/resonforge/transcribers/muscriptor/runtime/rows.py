@@ -18,14 +18,12 @@ from muscriptor.modules.streaming import ModelState
 from resonforge.transcribers.muscriptor.quality.generation_batch import (
     GenerationRequest,
 )
-from resonforge.transcribers.muscriptor.quality.generation_guard import (
-    GenerationCompleted,
-    GenerationGuard,
-    GuardFinding,
-    TokenBatchObserved,
-)
 from resonforge.transcribers.muscriptor.quality.generation_position import (
     GenerationPosition,
+)
+from resonforge.transcribers.muscriptor.quality.guard_protocol import (
+    GuardFinding,
+    RowGuard,
 )
 from resonforge.transcribers.muscriptor.runtime.prefill import (
     memory as prefill_memory,
@@ -130,7 +128,7 @@ class PreparedGenerationRow:
     source_width: int = 1
     temporal_floor: int = -1
     checkpoint_floor: int = -1
-    guard: GenerationGuard | None = None
+    guard: RowGuard | None = None
     guard_action: str = "continue"
     temporal_findings: list[GuardFinding] = field(default_factory=list)
     temporal_safe_frontier: GenerationPosition | None = None
@@ -159,10 +157,9 @@ class PreparedGenerationRow:
                 shift = grammar.shift_values[token]
                 if shift >= 0:
                     self.temporal_safe_frontier = GenerationPosition(index, shift)
-        config = self.request.guard_config
-        if config is None or config.mode == "off" or not self.request.guard_vocab:
+        if self.request.guard is None:
             return
-        self.guard = GenerationGuard(config)
+        self.guard = self.request.guard()
         generated = self.tokens[len(self.request.prompt_ids) :]
         if generated:
             self.observe_guard_tokens(tuple(generated))
@@ -170,14 +167,10 @@ class PreparedGenerationRow:
     def observe_guard_tokens(self, tokens: tuple[int, ...]) -> str:
         if self.guard is None:
             return "continue"
-        vocab = self.request.guard_vocab
-        events = tuple(vocab[token] for token in tokens if 0 <= token < len(vocab))
-        if not events:
-            return "continue"
-        decision = self.guard.dispatch(TokenBatchObserved(events))
-        if decision.action != "continue" and self.guard_action == "continue":
-            self.guard_action = decision.action
-        return decision.action
+        action = self.guard.observe(tokens)
+        if action != "continue" and self.guard_action == "continue":
+            self.guard_action = action
+        return action
 
     def observe_temporal_token(self, token: int) -> bool:
         """Accept one legal token or terminate before an illegal suffix."""
@@ -206,16 +199,7 @@ class PreparedGenerationRow:
                     last_safe_frontier=self.temporal_safe_frontier,
                 )
             )
-            role = (
-                "primary"
-                if self.request.guard_config is None
-                else self.request.guard_config.role
-            )
-            self.guard_action = (
-                "interrupt_to_recovery"
-                if role == "primary"
-                else "reject_candidate"
-            )
+            self.guard_action = self.request.on_temporal_regression
             self.finished = True
             return False
         if shift is not None:
@@ -229,17 +213,14 @@ class PreparedGenerationRow:
     def observe_guard_completion(self) -> None:
         if self.guard is None:
             return
-        decision = self.guard.dispatch(
-            GenerationCompleted(
-                emitted_eos=self.emitted_eos,
-                reached_max_length=(
-                    not self.emitted_eos
-                    and self.steps >= self.request.max_gen_len
-                ),
-            )
+        action = self.guard.complete(
+            emitted_eos=self.emitted_eos,
+            reached_max_length=(
+                not self.emitted_eos and self.steps >= self.request.max_gen_len
+            ),
         )
-        if decision.action != "continue" and self.guard_action == "continue":
-            self.guard_action = decision.action
+        if action != "continue" and self.guard_action == "continue":
+            self.guard_action = action
 
 
 @dataclass(frozen=True)

@@ -30,7 +30,6 @@ from resonforge.transcribers.muscriptor.quality.chunk_quality import (
 from resonforge.transcribers.muscriptor.quality.generation_anomaly import (
     AnomalyMonitorConfig,
     GenerationAnomalyEvent,
-    MonitorSummary,
 )
 from resonforge.transcribers.muscriptor.quality.generation_batch import (
     GenerationControlRequest,
@@ -48,11 +47,15 @@ from resonforge.transcribers.muscriptor.quality.generation_guard import (
     ChunkQualityReady,
     GenerationGuard,
     GenerationGuardConfig,
-    GuardAction,
-    GuardFinding,
     HardPitchEnvelopeConfig,
     OverlapVerificationDetector,
     VerifyReady,
+    row_guard_fields,
+)
+from resonforge.transcribers.muscriptor.quality.guard_protocol import (
+    GuardAction,
+    GuardFinding,
+    MonitorSummary,
 )
 from resonforge.transcribers.muscriptor.quality.model_protocol import (
     ModelProtocol,
@@ -347,7 +350,7 @@ def prepare_recovery_candidates(
         if (
             tokenizer.eos_id != request.eos_id
             or tokenizer.frame_rate != spec.expected_frame_rate
-            or tuple(tokenizer._vocab) != request.guard_vocab
+            or tuple(tokenizer._vocab) != spec.expected_vocab
         ):
             raise ValueError("recovery tokenizer is incompatible with primary")
         if (
@@ -363,7 +366,7 @@ def prepare_recovery_candidates(
     for spec in requests:
         collector = (
             _ShiftMarginCollector(
-                spec.request.guard_vocab,
+                spec.expected_vocab,
                 spec.request.trace_collector,
             )
             if spec.collect_shift_margins
@@ -631,8 +634,7 @@ def forcing_stream(
                     trace_context=(
                         *trace_context_prefix, "bootstrap", chunk_index
                     ),
-                    guard_config=primary_guard,
-                    guard_vocab=vocab,
+                    **row_guard_fields(primary_guard, vocab),
                     temporal_grammar=TemporalGrammarConfig.from_vocab(
                         vocab, tuple(prompt_ids), ()
                     ),
@@ -651,6 +653,7 @@ def forcing_stream(
                     ),
                 ),
                 expected_frame_rate=model._tokenizer.frame_rate,
+                expected_vocab=vocab,
                 target_model=first_chunk_model,
                 model_role="recovery",
                 collect_shift_margins=True,
@@ -718,8 +721,7 @@ def forcing_stream(
                 trace_collector=trace_collector,
                 trace_context=(*trace_context_prefix, "primary", chunk_index),
                 sampling_seed=None,
-                guard_config=primary_guard,
-                guard_vocab=tuple(model._tokenizer._vocab),
+                **row_guard_fields(primary_guard, tuple(model._tokenizer._vocab)),
                 temporal_grammar=TemporalGrammarConfig.from_vocab(
                     tuple(model._tokenizer._vocab),
                     tuple(prompt_ids),
@@ -1016,13 +1018,13 @@ def forcing_stream(
                         *trace_context_prefix, secondary_name, chunk_index
                     ),
                     checkpoint_token_ids=secondary_checkpoint,
-                    guard_config=recovery_guard,
-                    guard_vocab=vocab,
+                    **row_guard_fields(recovery_guard, vocab),
                     temporal_grammar=TemporalGrammarConfig.from_vocab(
                         vocab, tuple(secondary_prompt_ids), secondary_checkpoint
                     ),
                 ),
                 expected_frame_rate=model._tokenizer.frame_rate,
+                expected_vocab=vocab,
                 target_model=(
                     getattr(model, "_model_name", None)
                     if secondary_sampling
@@ -1055,13 +1057,13 @@ def forcing_stream(
                         *trace_context_prefix, "shifted_replay", chunk_index
                     ),
                     checkpoint_token_ids=shifted_checkpoint,
-                    guard_config=recovery_guard,
-                    guard_vocab=vocab,
+                    **row_guard_fields(recovery_guard, vocab),
                     temporal_grammar=TemporalGrammarConfig.from_vocab(
                         vocab, tuple(shifted_prompt_ids), shifted_checkpoint
                     ),
                 ),
                 expected_frame_rate=model._tokenizer.frame_rate,
+                expected_vocab=vocab,
                 target_model=getattr(model, "_model_name", None),
                 model_role="primary",
             )
@@ -1555,13 +1557,13 @@ def forcing_stream(
                         # resident handle. A live critical finding completes
                         # the row as terminally rejected; final validation
                         # still runs.
-                        guard_config=fresh_guard,
-                        guard_vocab=fresh_vocab,
+                        **row_guard_fields(fresh_guard, fresh_vocab),
                         temporal_grammar=TemporalGrammarConfig.from_vocab(
                             fresh_vocab, (), ()
                         ),
                     ),
                     expected_frame_rate=model._tokenizer.frame_rate,
+                    expected_vocab=fresh_vocab,
                     target_model=fresh_reanchor_model,
                     model_role="recovery",
                 )

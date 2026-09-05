@@ -13,6 +13,10 @@ from resonforge.transcribers.muscriptor.quality.chunk_quality import (
     AdaptiveChunkQualityAssessment,
     ChunkQualityMetrics,
 )
+from resonforge.transcribers.muscriptor.quality.guard_protocol import (
+    AnomalyMetrics,
+    MonitorSummary,
+)
 
 AnomalyMode = Literal["off", "diagnostics", "recovery"]
 
@@ -52,35 +56,9 @@ DEFAULT_ANOMALY_CONFIG = AnomalyMonitorConfig()
 
 
 @dataclass(frozen=True)
-class AnomalyMetrics:
-    generated_tokens: int
-    window_tokens: int
-    repeated_4gram_rate: float
-    repeated_8gram_rate: float
-    repeated_16gram_rate: float
-    unique_token_rate: float
-    gzip_ratio: float
-    tokens_since_shift: int
-    score: float
-    provisional_gzip_thresholds: bool = True
-    late_missing_eos_available: bool = False
-    same_pitch_retrigger_available: bool = False
-
-
-@dataclass(frozen=True)
 class AnomalyObservation:
     metrics: AnomalyMetrics | None = None
     trigger_reason: str | None = None
-
-
-@dataclass(frozen=True)
-class MonitorSummary:
-    generated_tokens: int
-    emitted_eos: bool
-    trigger_reason: str | None
-    last_metrics: AnomalyMetrics | None
-    poll_metrics: tuple[AnomalyMetrics, ...]
-    periodic_window_streak: int = 0
 
 
 @dataclass(frozen=True)
