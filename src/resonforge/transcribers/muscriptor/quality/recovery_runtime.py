@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn.functional as F
-from muscriptor.diagnostics import route_iterator
 from muscriptor.events import ChunkBoundary, OpenNoteTracker, ProgressEvent
 from muscriptor.model_trace import ModelTraceCollector
 from muscriptor.modules.conditioners import ConditioningAttributes
@@ -41,7 +40,6 @@ from resonforge.transcribers.muscriptor.quality.generation_batch import (
     RecoveryClaimMember,
     RecoveryGroupClaim,
     TemporalGrammarConfig,
-    run_generation_batch,
 )
 from resonforge.transcribers.muscriptor.quality.generation_guard import (
     ChunkQualityReady,
@@ -77,10 +75,11 @@ from resonforge.transcribers.muscriptor.quality.recovery import (
     select_checkpoint_candidate,
 )
 
+SecondaryCandidate = Literal["secondary_model", "new_seed"]
 RecoverySelection = Literal["checkpoint", "completed_quality"]
 
 if TYPE_CHECKING:
-    from muscriptor.transcription_model import TranscriptionModel
+    pass
 
 _SAMPLE_RATE = 16000
 _SEGMENT_DURATION = 5.0
@@ -430,41 +429,6 @@ class _ShiftMarginCollector:
         self.margins.append(margin)
 
 
-def run_recovery_candidate(
-    model: TranscriptionModel,
-    request: RecoveryCandidateSpec,
-    *,
-    stdout_logger: logging.Logger | None = None,
-) -> RecoveryCandidateResult:
-    """Run one recovery candidate on the caller-owned model worker."""
-    return run_recovery_candidates(
-        model,
-        (request,),
-        stdout_logger=stdout_logger,
-    )[0]
-
-
-def run_recovery_candidates(
-    model: TranscriptionModel,
-    requests: tuple[RecoveryCandidateSpec, ...],
-    *,
-    stdout_logger: logging.Logger | None = None,
-) -> tuple[RecoveryCandidateResult, ...]:
-    """Generate compatible independent recovery rows in one model batch."""
-    if not requests:
-        return ()
-    prepared = prepare_recovery_candidates(model, requests)
-    generated = run_generation_batch(
-        model,
-        tuple(item.request for item in prepared),
-        stdout_logger=stdout_logger,
-    )
-    return tuple(
-        complete_recovery_candidate(item, result)
-        for item, result in zip(prepared, generated, strict=True)
-    )
-
-
 def prepare_recovery_candidates(
     model: ModelProtocol,
     requests: tuple[RecoveryCandidateSpec, ...],
@@ -572,7 +536,6 @@ def forcing_stream(
     recovery_seed: int,
     stdout_logger: logging.Logger | None,
     stderr_logger: logging.Logger | None,
-    defer_generation: bool = False,
     checkpoint_generation: bool = False,
     trace_collector: ModelTraceCollector | None = None,
     trace_context_prefix: tuple[object, ...] = (),
@@ -582,6 +545,15 @@ def forcing_stream(
     hard_pitch_envelope: HardPitchEnvelopeConfig | None = None,
     overlap_probe_enabled: bool = False,
     fresh_reanchor: bool = True,
+    # Which second attempt a triggered chunk gets. Both keep the shifted
+    # replay beside them; they differ in what the *other* candidate varies:
+    #   secondary_model -- a larger model, same sampling
+    #   new_seed        -- the same model, resampled from a derived seed
+    # The two are not interchangeable. Every other candidate here (bootstrap,
+    # secondary_model, fresh_reanchor) escalates model size, so `new_seed` is
+    # the only one that answers "this decode was unlucky" rather than "this
+    # model is not strong enough", and it costs no second model.
+    secondary_candidate: SecondaryCandidate = "secondary_model",
 ) -> Iterator[
     int
     | ChunkBoundary
@@ -743,7 +715,7 @@ def forcing_stream(
         primary_guard_summary: MonitorSummary | None = None
         primary_guard_findings: tuple[GuardFinding, ...] = ()
         deferred_primary_handle: object | None = None
-        if defer_generation and chunk_index == 0 and first_chunk_model is not None:
+        if chunk_index == 0 and first_chunk_model is not None:
             vocab = tuple(model._tokenizer._vocab)
             bootstrap_result = yield RecoveryCandidateSpec(
                 candidate_name="bootstrap",
@@ -818,7 +790,7 @@ def forcing_stream(
             primary_guard_summary = bootstrap_result.guard_summary
             primary_guard_findings = bootstrap_result.guard_findings
             deferred_primary_handle = bootstrap_result.resident_handle
-        elif defer_generation:
+        else:
             checkpoint_token_ids = (
                 checkpoint_shift_tokens(
                     model._tokenizer._vocab, verification_end_shift
@@ -885,34 +857,6 @@ def forcing_stream(
             primary_guard_summary = primary_result.guard_summary
             primary_guard_findings = primary_result.guard_findings
             deferred_primary_handle = primary_result.resident_handle
-        else:
-            primary_steps = route_iterator(
-                model._model.generate(
-                    prompt=(
-                        torch.tensor(
-                            [prompt_ids],
-                            device=model._device,
-                            dtype=torch.long,
-                        )
-                        if prompt_ids
-                        else None
-                    ),
-                    conditions=[condition],
-                    max_gen_len=max_gen_len,
-                    use_sampling=use_sampling,
-                    temp=temperature,
-                    top_k=0,
-                    top_p=0.0,
-                    cfg_coef=cfg_coef,
-                    early_stop_on_token=eos_id,
-                    beam_size=beam_size,
-                    forbidden_tokens=forbidden_tokens,
-                    trace_collectors=(trace_collector,),
-                    trace_contexts=((*trace_context_prefix, "primary", chunk_index),),
-                    trace_prompt_lengths=(len(prompt_ids),),
-                ),
-                stdout_logger,
-            )
         primary_generation = MonitoredGeneration(
             primary_steps,
             eos_id=eos_id,
@@ -1136,11 +1080,7 @@ def forcing_stream(
             secondary_condition = (
                 shifted_condition if secondary_recovery_shifted else condition
             )
-            secondary_name = (
-                "secondary_model"
-                if defer_generation
-                else "new_seed"
-            )
+            secondary_name = secondary_candidate
             secondary_sampling = secondary_name == "new_seed"
             secondary_seek = shifted_seek if secondary_recovery_shifted else seek
             secondary_prompt_ids = (
@@ -1232,34 +1172,22 @@ def forcing_stream(
                 model_role="primary",
             )
 
-            if defer_generation:
-                recovery_results = yield RecoveryCandidateGroupRequest(
-                    (shifted_request, secondary_request),
-                    parent_resident_handle=primary_handle,
+            recovery_results = yield RecoveryCandidateGroupRequest(
+                (shifted_request, secondary_request),
+                parent_resident_handle=primary_handle,
+            )
+            if (
+                not isinstance(recovery_results, tuple)
+                or len(recovery_results) != 2
+                or not all(
+                    isinstance(result, RecoveryCandidateResult)
+                    for result in recovery_results
                 )
-                if (
-                    not isinstance(recovery_results, tuple)
-                    or len(recovery_results) != 2
-                    or not all(
-                        isinstance(result, RecoveryCandidateResult)
-                        for result in recovery_results
-                    )
-                ):
-                    raise TypeError(
-                        "recovery candidate group requires compatible results"
-                    )
-                shifted_result, external_secondary = recovery_results
-            else:
-                shifted_result = run_recovery_candidate(
-                    model,
-                    shifted_request,
-                    stdout_logger=stdout_logger,
+            ):
+                raise TypeError(
+                    "recovery candidate group requires compatible results"
                 )
-                external_secondary = run_recovery_candidate(
-                    model,
-                    secondary_request,
-                    stdout_logger=stdout_logger,
-                )
+            shifted_result, external_secondary = recovery_results
 
             candidate_results = {
                 "shifted_replay": shifted_result,
@@ -1743,14 +1671,7 @@ def forcing_stream(
                     target_model=fresh_reanchor_model,
                     model_role="recovery",
                 )
-                if defer_generation:
-                    fresh_result = yield fresh_request
-                else:
-                    fresh_result = run_recovery_candidate(
-                        model,
-                        fresh_request,
-                        stdout_logger=stdout_logger,
-                    )
+                fresh_result = yield fresh_request
                 if not isinstance(fresh_result, RecoveryCandidateResult):
                     raise TypeError(
                         "fresh re-anchor requires a compatible recovery result"

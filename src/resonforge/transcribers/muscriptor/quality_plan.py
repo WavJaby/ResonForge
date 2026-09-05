@@ -49,6 +49,12 @@ class MuscriptorQualityPlan:
     trace_collector: Any
     trace_context_prefix: tuple[object, ...]
     overlap_probe: bool
+    #: Which second attempt a triggered chunk gets beside the shifted replay.
+    #: `secondary_model` escalates to a larger model; `new_seed` resamples the
+    #: same one. Every other candidate escalates size, so this is the only
+    #: dial that asks whether a bad chunk was unlucky rather than under-served
+    #: -- and the cheap answer, since it loads no second model.
+    secondary_candidate: str = "secondary_model"
 
     def __post_init__(self) -> None:
         if self.recovery_seed < 0:
@@ -95,32 +101,30 @@ class MuscriptorQualityPlan:
             request.temperature,
             request.cfg_coef,
             request.no_eos_is_ok,
-            1,
-            request.forbidden_tokens,
-            OverlapWindow(
+            beam_size=1,
+            forbidden_tokens=request.forbidden_tokens,
+            overlap_window=OverlapWindow(
                 replay_seconds=self.replay_seconds,
                 verification_seconds=self.min_verify_seconds,
             ),
-            self.anomaly_detection,
-            self.overlap_detection,
-            self.recovery,
-            self.recovery_shift_seconds,
-            "checkpoint",
-            False,
-            DEFAULT_ANOMALY_CONFIG,
-            self.recovery_seed,
-            request.stdout_logger,
-            request.stderr_logger,
-            # The scheduler owns every forward, so generation is always
-            # deferred here -- a row is never run inline by the producer.
-            True,
-            self.checkpoint_generation,
-            self.trace_collector,
-            self.trace_context_prefix,
-            self.first_chunk_model,
-            self.fresh_reanchor_model,
-            self.chunk_quality_history,
-            self.hard_pitch_envelope,
-            self.overlap_probe,
+            anomaly_detection=self.anomaly_detection,
+            overlap_detection=self.overlap_detection,
+            recovery=self.recovery,
+            recovery_shift_seconds=self.recovery_shift_seconds,
+            recovery_selection="checkpoint",
+            secondary_recovery_shifted=False,
+            anomaly_config=DEFAULT_ANOMALY_CONFIG,
+            recovery_seed=self.recovery_seed,
+            stdout_logger=request.stdout_logger,
+            stderr_logger=request.stderr_logger,
+            checkpoint_generation=self.checkpoint_generation,
+            trace_collector=self.trace_collector,
+            trace_context_prefix=self.trace_context_prefix,
+            first_chunk_model=self.first_chunk_model,
+            fresh_reanchor_model=self.fresh_reanchor_model,
+            chunk_quality_history=self.chunk_quality_history,
+            hard_pitch_envelope=self.hard_pitch_envelope,
+            overlap_probe_enabled=self.overlap_probe,
             fresh_reanchor=self.fresh_reanchor,
+            secondary_candidate=self.secondary_candidate,
         )

@@ -54,11 +54,6 @@ class ModelProtocol(Protocol):
     `GenerationRequest` and the caller runs it, which is why the scheduler can
     own execution without this contract knowing it exists.
 
-    One access escapes this contract on purpose -- `forcing_stream` reaches
-    `model._model.generate` in its non-deferred branch, the inline path a
-    caller with no executor takes. Declaring `_model` here would put the whole
-    LM in a contract that exists to keep it out. Delete that branch and this
-    paragraph together, once `transcribe` no longer defers.
     """
 
     _tokenizer: TokenizerProtocol
