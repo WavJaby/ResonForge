@@ -1262,8 +1262,6 @@ def _transcribe_scheduled(
                     if step.generation_request is not None:
                         from resonforge.transcribers.muscriptor.quality.generation_batch import (
                             GenerationControlRequest,
-                        )
-                        from resonforge.transcribers.muscriptor.quality.recovery_runtime import (
                             RecoveryCandidateGroupRequest,
                             RecoveryCandidateSpec,
                         )

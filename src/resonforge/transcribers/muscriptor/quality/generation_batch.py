@@ -235,3 +235,112 @@ class GenerationControlResult:
     """Acknowledgement for a generation control action without token output."""
 
     discarded: bool
+
+
+@dataclass(frozen=True)
+class RecoveryCandidateSpec:
+    """One recovery candidate: a plain `GenerationRequest` plus its envelope.
+
+    Generation semantics live only on `request` -- the same type, checkpoint
+    derivation (`checkpoint_shift_tokens`) and scheduler protocol the primary
+    chunk uses. The envelope is what actually differs between a candidate and
+    a primary chunk: where it runs (`target_model` / `model_role`) and how the
+    completed row is validated (`candidate_name`, the frame-rate check, margin
+    collection). The scheduler-facing properties delegate, so a spec submits
+    exactly like the request it carries.
+    Replaces `RecoveryCandidateRequest`, which duplicated fourteen request
+    fields and six property implementations under second names
+    (`expected_vocab` = `guard_vocab`, `expected_eos_id` = `eos_id`,
+    `verify_shift_value` -> `checkpoint_token_ids`).
+    """
+
+    candidate_name: Literal[
+        "shifted_replay",
+        "new_seed",
+        "secondary_model",
+        "bootstrap",
+        "fresh_reanchor",
+    ]
+    request: GenerationRequest
+    expected_frame_rate: int
+    target_model: str | None = None
+    model_role: Literal["primary", "recovery"] = "recovery"
+    collect_shift_margins: bool = False
+
+    # -- BatchSubmission.item protocol, delegated ------------------------
+    @property
+    def condition(self) -> ConditioningAttributes:
+        return self.request.condition
+
+    @property
+    def cfg_coef(self) -> float:
+        return self.request.cfg_coef
+
+    @property
+    def prompt_ids(self) -> tuple[int, ...]:
+        return self.request.prompt_ids
+
+    @property
+    def use_sampling(self) -> bool:
+        return self.request.use_sampling
+
+    @property
+    def recovery_group_claim(self) -> RecoveryGroupClaim | None:
+        return self.request.recovery_group_claim
+
+    @property
+    def prefill_token_budget(self) -> int:
+        return self.request.prefill_token_budget
+
+    @property
+    def remaining_decode_token_budget(self) -> int:
+        return self.request.remaining_decode_token_budget
+
+    @property
+    def requires_dependency_credit(self) -> bool:
+        return self.request.requires_dependency_credit
+
+    @property
+    def initial_kv_capacity_bucket(self) -> int:
+        return self.request.initial_kv_capacity_bucket
+
+    @property
+    def session_compatibility_key(self) -> tuple[object, ...]:
+        return self.request.session_compatibility_key
+
+    @property
+    def compatibility_key(self) -> tuple[object, ...]:
+        return self.request.compatibility_key
+
+
+@dataclass(frozen=True)
+class RecoveryCandidateGroupRequest:
+    """Independent recovery candidates submitted together to the scheduler."""
+
+    requests: tuple[RecoveryCandidateSpec, ...]
+    parent_resident_handle: object | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.requests) < 2:
+            raise ValueError("recovery candidate group requires at least two rows")
+
+
+@dataclass(frozen=True)
+class RecoveryCandidateResult:
+    """Plain completed candidate data returned by a model worker."""
+
+    candidate_name: Literal[
+        "shifted_replay",
+        "new_seed",
+        "secondary_model",
+        "bootstrap",
+        "fresh_reanchor",
+    ]
+    tokens: tuple[int, ...]
+    emitted_eos: bool
+    model_name: str
+    shift_margins: tuple[float, ...] = ()
+    resident_handle: object | None = None
+    guard_action: GuardAction = "continue"
+    guard_findings: tuple[GuardFinding, ...] = ()
+    guard_summary: MonitorSummary | None = None

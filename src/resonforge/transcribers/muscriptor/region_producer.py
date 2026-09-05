@@ -65,8 +65,6 @@ class RegionProducerSession:
         from resonforge.transcribers.muscriptor.quality.generation_batch import (
             GenerationControlRequest,
             GenerationRequest,
-        )
-        from resonforge.transcribers.muscriptor.quality.recovery_runtime import (
             RecoveryCandidateGroupRequest,
             RecoveryCandidateSpec,
         )
