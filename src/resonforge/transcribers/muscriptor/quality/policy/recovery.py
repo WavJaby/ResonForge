@@ -10,15 +10,17 @@ from typing import Literal
 import torch
 from muscriptor.tokenizer.notes import Event
 
-from resonforge.transcribers.muscriptor.quality.chunk_quality import (
+from resonforge.transcribers.muscriptor.quality.contract.generation_position import (
+    GenerationPosition,
+)
+from resonforge.transcribers.muscriptor.quality.contract.guard_protocol import (
+    GuardFinding,
+)
+from resonforge.transcribers.muscriptor.quality.policy.chunk_quality import (
     AdaptiveChunkQualityAssessment,
     ChunkQualityMetrics,
 )
-from resonforge.transcribers.muscriptor.quality.generation_position import (
-    GenerationPosition,
-)
-from resonforge.transcribers.muscriptor.quality.guard_protocol import GuardFinding
-from resonforge.transcribers.muscriptor.quality.overlap import OverlapMatch
+from resonforge.transcribers.muscriptor.quality.policy.overlap import OverlapMatch
 
 RecoveryCandidateName = Literal[
     "shifted_replay",

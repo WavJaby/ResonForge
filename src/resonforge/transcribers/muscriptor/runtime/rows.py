@@ -15,13 +15,13 @@ from enum import StrEnum
 import torch
 from muscriptor.modules.streaming import ModelState
 
-from resonforge.transcribers.muscriptor.quality.generation_batch import (
+from resonforge.transcribers.muscriptor.quality.contract.generation_batch import (
     GenerationRequest,
 )
-from resonforge.transcribers.muscriptor.quality.generation_position import (
+from resonforge.transcribers.muscriptor.quality.contract.generation_position import (
     GenerationPosition,
 )
-from resonforge.transcribers.muscriptor.quality.guard_protocol import (
+from resonforge.transcribers.muscriptor.quality.contract.guard_protocol import (
     GuardFinding,
     RowGuard,
 )

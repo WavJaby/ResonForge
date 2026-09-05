@@ -9,13 +9,13 @@ from typing import Literal
 
 from muscriptor.tokenizer.notes import Event
 
-from resonforge.transcribers.muscriptor.quality.chunk_quality import (
-    AdaptiveChunkQualityAssessment,
-    ChunkQualityMetrics,
-)
-from resonforge.transcribers.muscriptor.quality.guard_protocol import (
+from resonforge.transcribers.muscriptor.quality.contract.guard_protocol import (
     AnomalyMetrics,
     MonitorSummary,
+)
+from resonforge.transcribers.muscriptor.quality.policy.chunk_quality import (
+    AdaptiveChunkQualityAssessment,
+    ChunkQualityMetrics,
 )
 
 AnomalyMode = Literal["off", "diagnostics", "recovery"]

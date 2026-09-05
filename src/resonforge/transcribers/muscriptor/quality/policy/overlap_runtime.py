@@ -7,8 +7,10 @@ from dataclasses import dataclass
 
 from muscriptor.tokenizer.notes import DRUM_PROGRAM, NoteEvent
 
-from resonforge.transcribers.muscriptor.quality.model_protocol import TokenizerProtocol
-from resonforge.transcribers.muscriptor.quality.overlap import (
+from resonforge.transcribers.muscriptor.quality.contract.model_protocol import (
+    TokenizerProtocol,
+)
+from resonforge.transcribers.muscriptor.quality.policy.overlap import (
     OverlapMatch,
     OverlapWindow,
     match_note_events,

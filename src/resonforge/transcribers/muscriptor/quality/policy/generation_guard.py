@@ -8,7 +8,16 @@ from typing import Literal, Protocol
 
 from muscriptor.tokenizer.notes import Event
 
-from resonforge.transcribers.muscriptor.quality.chunk_quality import (
+from resonforge.transcribers.muscriptor.quality.contract.generation_position import (
+    GenerationPosition,
+)
+from resonforge.transcribers.muscriptor.quality.contract.guard_protocol import (
+    AnomalyMetrics,
+    GuardAction,
+    GuardFinding,
+    MonitorSummary,
+)
+from resonforge.transcribers.muscriptor.quality.policy.chunk_quality import (
     DEFAULT_ADAPTIVE_CHUNK_QUALITY_CONFIG,
     AdaptiveChunkQualityAssessment,
     AdaptiveChunkQualityConfig,
@@ -17,20 +26,11 @@ from resonforge.transcribers.muscriptor.quality.chunk_quality import (
     RestartChainCollapseEvidence,
     assess_adaptive_chunk_quality,
 )
-from resonforge.transcribers.muscriptor.quality.generation_anomaly import (
+from resonforge.transcribers.muscriptor.quality.policy.generation_anomaly import (
     DEFAULT_ANOMALY_CONFIG,
     AnomalyMode,
     AnomalyMonitorConfig,
     RollingAnomalyMonitor,
-)
-from resonforge.transcribers.muscriptor.quality.generation_position import (
-    GenerationPosition,
-)
-from resonforge.transcribers.muscriptor.quality.guard_protocol import (
-    AnomalyMetrics,
-    GuardAction,
-    GuardFinding,
-    MonitorSummary,
 )
 
 GuardRole = Literal["primary", "recovery", "fresh"]

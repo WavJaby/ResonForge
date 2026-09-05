@@ -10,7 +10,7 @@ from muscriptor.model_trace import ModelTraceCollector
 from muscriptor.modules.conditioners import ConditioningAttributes
 from muscriptor.tokenizer.notes import Event
 
-from resonforge.transcribers.muscriptor.quality.guard_protocol import (
+from resonforge.transcribers.muscriptor.quality.contract.guard_protocol import (
     GuardAction,
     GuardFinding,
     MonitorSummary,

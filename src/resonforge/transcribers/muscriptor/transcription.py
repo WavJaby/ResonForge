@@ -225,7 +225,7 @@ def _prepare_recovery_continuous_work(
     requests: tuple[object, ...],
 ) -> tuple[PreparedWorkItem, ...]:
     """Build recovery session rows and retain role-specific result adapters."""
-    from resonforge.transcribers.muscriptor.quality.recovery_runtime import (
+    from resonforge.transcribers.muscriptor.quality.policy.recovery_runtime import (
         complete_recovery_candidate,
         prepare_recovery_candidates,
     )
@@ -626,16 +626,16 @@ def _event_to_jsonl(event: object) -> dict[str, object] | None:
     """Convert one event into the CLI-style JSONL shape."""
     from muscriptor.events import NoteEndEvent, NoteStartEvent
 
-    from resonforge.transcribers.muscriptor.quality.generation_anomaly import (
+    from resonforge.transcribers.muscriptor.quality.policy.generation_anomaly import (
         GenerationAnomalyEvent,
     )
-    from resonforge.transcribers.muscriptor.quality.overlap import (
+    from resonforge.transcribers.muscriptor.quality.policy.overlap import (
         OverlapDiagnosticsEvent,
     )
-    from resonforge.transcribers.muscriptor.quality.recovery import (
+    from resonforge.transcribers.muscriptor.quality.policy.recovery import (
         RecoveryDiagnosticsEvent,
     )
-    from resonforge.transcribers.muscriptor.quality.recovery_runtime import (
+    from resonforge.transcribers.muscriptor.quality.policy.recovery_runtime import (
         FirstChunkBootstrapEvent,
     )
 
@@ -1011,11 +1011,11 @@ def _transcribe_scheduled(
         recovery_model_name,
         bootstrap_model_name,
     )
-    from resonforge.transcribers.muscriptor.quality.chunk_quality import (
+    from resonforge.transcribers.muscriptor.quality.policy.chunk_quality import (
         DEFAULT_ADAPTIVE_CHUNK_QUALITY_CONFIG,
         ChunkQualityHistory,
     )
-    from resonforge.transcribers.muscriptor.quality.generation_guard import (
+    from resonforge.transcribers.muscriptor.quality.policy.generation_guard import (
         DEFAULT_HARD_PITCH_ENVELOPE,
     )
 
@@ -1260,7 +1260,7 @@ def _transcribe_scheduled(
                     payloads_by_region[index].extend(step.payloads)
                     report_completed(step.completed_delta)
                     if step.generation_request is not None:
-                        from resonforge.transcribers.muscriptor.quality.generation_batch import (
+                        from resonforge.transcribers.muscriptor.quality.contract.generation_batch import (
                             GenerationControlRequest,
                             RecoveryCandidateGroupRequest,
                             RecoveryCandidateSpec,

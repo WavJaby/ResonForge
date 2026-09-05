@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
-from resonforge.transcribers.muscriptor.quality.generation_position import (
+from resonforge.transcribers.muscriptor.quality.contract.generation_position import (
     GenerationPosition,
 )
 

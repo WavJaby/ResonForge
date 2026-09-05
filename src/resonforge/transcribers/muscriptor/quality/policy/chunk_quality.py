@@ -9,10 +9,12 @@ from threading import Lock
 
 from muscriptor.tokenizer.notes import DRUM_PROGRAM, NoteEvent
 
-from resonforge.transcribers.muscriptor.quality.generation_position import (
+from resonforge.transcribers.muscriptor.quality.contract.generation_position import (
     GenerationPosition,
 )
-from resonforge.transcribers.muscriptor.quality.model_protocol import TokenizerProtocol
+from resonforge.transcribers.muscriptor.quality.contract.model_protocol import (
+    TokenizerProtocol,
+)
 
 
 @dataclass(frozen=True)
@@ -222,7 +224,7 @@ def _positioned_note_events(
     list[GenerationPosition],
     set[tuple[int, int]],
 ]:
-    from resonforge.transcribers.muscriptor.quality import overlap_runtime
+    from resonforge.transcribers.muscriptor.quality.policy import overlap_runtime
 
     frame_rate = tokenizer.frame_rate
     start_tick = round(source_seek * frame_rate)
@@ -345,7 +347,7 @@ def measure_chunk_quality(
     generated_tokens: int,
 ) -> ChunkQualityMetrics:
     """Measure scale-normalized output owned by one completed chunk."""
-    from resonforge.transcribers.muscriptor.quality import overlap_runtime
+    from resonforge.transcribers.muscriptor.quality.policy import overlap_runtime
 
     duration = max(0.01, ownership_end - ownership_start)
     events = overlap_runtime.note_events_in_range(

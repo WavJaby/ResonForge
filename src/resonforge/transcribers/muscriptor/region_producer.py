@@ -62,7 +62,7 @@ class RegionProducerSession:
         """Consume one model result and stop at the next scheduling boundary."""
         from muscriptor.events import ProgressEvent
 
-        from resonforge.transcribers.muscriptor.quality.generation_batch import (
+        from resonforge.transcribers.muscriptor.quality.contract.generation_batch import (
             GenerationControlRequest,
             GenerationRequest,
             RecoveryCandidateGroupRequest,

@@ -17,21 +17,7 @@ from muscriptor.modules.conditioners import ConditioningAttributes
 from muscriptor.tokenizer.notes import Event
 from muscriptor.utils.sampling import chosen_token_margins
 
-from resonforge.transcribers.muscriptor.quality import overlap_runtime
-from resonforge.transcribers.muscriptor.quality.chunk_quality import (
-    AdaptiveChunkQualityAssessment,
-    ChunkQualityHistory,
-    ChunkQualityMetrics,
-    ChunkQualityReference,
-    assess_adaptive_chunk_quality,
-    locate_restart_chain_collapse,
-    measure_chunk_quality,
-)
-from resonforge.transcribers.muscriptor.quality.generation_anomaly import (
-    AnomalyMonitorConfig,
-    GenerationAnomalyEvent,
-)
-from resonforge.transcribers.muscriptor.quality.generation_batch import (
+from resonforge.transcribers.muscriptor.quality.contract.generation_batch import (
     GenerationControlRequest,
     GenerationControlResult,
     GenerationRequest,
@@ -43,7 +29,30 @@ from resonforge.transcribers.muscriptor.quality.generation_batch import (
     RecoveryGroupClaim,
     TemporalGrammarConfig,
 )
-from resonforge.transcribers.muscriptor.quality.generation_guard import (
+from resonforge.transcribers.muscriptor.quality.contract.guard_protocol import (
+    GuardAction,
+    GuardFinding,
+    MonitorSummary,
+)
+from resonforge.transcribers.muscriptor.quality.contract.model_protocol import (
+    ModelProtocol,
+    TokenizerProtocol,
+)
+from resonforge.transcribers.muscriptor.quality.policy import overlap_runtime
+from resonforge.transcribers.muscriptor.quality.policy.chunk_quality import (
+    AdaptiveChunkQualityAssessment,
+    ChunkQualityHistory,
+    ChunkQualityMetrics,
+    ChunkQualityReference,
+    assess_adaptive_chunk_quality,
+    locate_restart_chain_collapse,
+    measure_chunk_quality,
+)
+from resonforge.transcribers.muscriptor.quality.policy.generation_anomaly import (
+    AnomalyMonitorConfig,
+    GenerationAnomalyEvent,
+)
+from resonforge.transcribers.muscriptor.quality.policy.generation_guard import (
     ChunkQualityReady,
     GenerationGuard,
     GenerationGuardConfig,
@@ -52,25 +61,16 @@ from resonforge.transcribers.muscriptor.quality.generation_guard import (
     VerifyReady,
     row_guard_fields,
 )
-from resonforge.transcribers.muscriptor.quality.guard_protocol import (
-    GuardAction,
-    GuardFinding,
-    MonitorSummary,
-)
-from resonforge.transcribers.muscriptor.quality.model_protocol import (
-    ModelProtocol,
-    TokenizerProtocol,
-)
-from resonforge.transcribers.muscriptor.quality.monitored_generation import (
+from resonforge.transcribers.muscriptor.quality.policy.monitored_generation import (
     MonitoredGeneration,
 )
-from resonforge.transcribers.muscriptor.quality.overlap import (
+from resonforge.transcribers.muscriptor.quality.policy.overlap import (
     OverlapDiagnosticsEvent,
     OverlapMatch,
     OverlapWindow,
     match_note_events,
 )
-from resonforge.transcribers.muscriptor.quality.recovery import (
+from resonforge.transcribers.muscriptor.quality.policy.recovery import (
     OverlapProvenanceProbe,
     RecoveryDiagnosticsEvent,
     build_overlap_probe_stream,

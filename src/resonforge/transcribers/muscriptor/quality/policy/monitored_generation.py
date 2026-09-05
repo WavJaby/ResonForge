@@ -9,17 +9,19 @@ from dataclasses import dataclass
 import torch
 from muscriptor.tokenizer.notes import Event
 
-from resonforge.transcribers.muscriptor.quality.generation_anomaly import (
+from resonforge.transcribers.muscriptor.quality.contract.guard_protocol import (
+    MonitorSummary,
+)
+from resonforge.transcribers.muscriptor.quality.policy.generation_anomaly import (
     DEFAULT_ANOMALY_CONFIG,
     AnomalyMonitorConfig,
 )
-from resonforge.transcribers.muscriptor.quality.generation_guard import (
+from resonforge.transcribers.muscriptor.quality.policy.generation_guard import (
     GenerationGuard,
     GenerationGuardConfig,
     GuardDecision,
     TokenBatchObserved,
 )
-from resonforge.transcribers.muscriptor.quality.guard_protocol import MonitorSummary
 
 
 @dataclass(frozen=True)

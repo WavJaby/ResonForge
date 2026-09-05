@@ -27,12 +27,12 @@ from muscriptor.modules.streaming import (
     select_state_rows,
 )
 
-from resonforge.transcribers.muscriptor.quality.generation_batch import (
+from resonforge.transcribers.muscriptor.quality.contract.generation_batch import (
     GenerationControlResult,
     GenerationRequest,
     GenerationResult,
 )
-from resonforge.transcribers.muscriptor.quality.guard_protocol import (
+from resonforge.transcribers.muscriptor.quality.contract.guard_protocol import (
     GuardFinding,
 )
 from resonforge.transcribers.muscriptor.runtime.decode.graphs import (

@@ -16,7 +16,7 @@ from contextlib import nullcontext
 import torch
 from muscriptor.modules.streaming import ModelState, increment_steps
 
-from resonforge.transcribers.muscriptor.quality.generation_batch import (
+from resonforge.transcribers.muscriptor.quality.contract.generation_batch import (
     GenerationRequest,
 )
 from resonforge.transcribers.muscriptor.runtime.generation_state import (

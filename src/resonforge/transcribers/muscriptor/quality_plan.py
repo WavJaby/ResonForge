@@ -82,11 +82,13 @@ class MuscriptorQualityPlan:
 
     def stream(self, model: object, request: Any) -> Iterator[object]:
         """Yield this region's tokens, boundaries and diagnostics."""
-        from resonforge.transcribers.muscriptor.quality.generation_anomaly import (
+        from resonforge.transcribers.muscriptor.quality.policy.generation_anomaly import (
             DEFAULT_ANOMALY_CONFIG,
         )
-        from resonforge.transcribers.muscriptor.quality.overlap import OverlapWindow
-        from resonforge.transcribers.muscriptor.quality.recovery_runtime import (
+        from resonforge.transcribers.muscriptor.quality.policy.overlap import (
+            OverlapWindow,
+        )
+        from resonforge.transcribers.muscriptor.quality.policy.recovery_runtime import (
             forcing_stream,
         )
 
