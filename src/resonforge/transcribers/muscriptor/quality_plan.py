@@ -18,6 +18,7 @@ scheduled any other way: `transcribe` refuses a plan beside a wider batch.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -130,3 +131,65 @@ class MuscriptorQualityPlan:
             fresh_reanchor=self.fresh_reanchor,
             secondary_candidate=self.secondary_candidate,
         )
+
+
+def new_chunk_quality_history() -> Any:
+    """One stem's rolling reference for adaptive chunk-quality assessment.
+
+    Built once per stem and handed to every region's plan -- an accumulator,
+    not a per-plan default, which is why it is a function and not a field
+    default.
+    """
+    from resonforge.transcribers.muscriptor.quality.policy.chunk_quality import (
+        DEFAULT_ADAPTIVE_CHUNK_QUALITY_CONFIG,
+        ChunkQualityHistory,
+    )
+
+    return ChunkQualityHistory(DEFAULT_ADAPTIVE_CHUNK_QUALITY_CONFIG.history_size)
+
+
+def hard_pitch_envelope_for(stem: str) -> Any:
+    """Physical pitch bounds for a stem, or `None` where pitch means nothing.
+
+    Percussion has no pitch to bound, and the residual stem holds whatever the
+    separator could not place, so a bound on either rejects legal output.
+    Which stems those are is a quality judgement, so it is decided here rather
+    than by whoever assembles the plan.
+    """
+    from resonforge.transcribers.muscriptor.quality.policy.generation_guard import (
+        DEFAULT_HARD_PITCH_ENVELOPE,
+    )
+
+    return None if stem in {"other", "drums"} else DEFAULT_HARD_PITCH_ENVELOPE
+
+
+def diagnostics_payload(event: object) -> dict[str, object] | None:
+    """The wire shape of one quality diagnostics event, or `None` for anything else.
+
+    These events are the policy's own vocabulary, so the policy names their
+    payloads. A caller routing a mixed stream asks here and keeps its own
+    `isinstance` ladder to the events it owns.
+    """
+    from resonforge.transcribers.muscriptor.quality.policy.generation_anomaly import (
+        GenerationAnomalyEvent,
+    )
+    from resonforge.transcribers.muscriptor.quality.policy.overlap import (
+        OverlapDiagnosticsEvent,
+    )
+    from resonforge.transcribers.muscriptor.quality.policy.recovery import (
+        RecoveryDiagnosticsEvent,
+    )
+    from resonforge.transcribers.muscriptor.quality.policy.recovery_runtime import (
+        FirstChunkBootstrapEvent,
+    )
+
+    names = {
+        OverlapDiagnosticsEvent: "overlap_diagnostics",
+        GenerationAnomalyEvent: "generation_anomaly",
+        RecoveryDiagnosticsEvent: "recovery_diagnostics",
+        FirstChunkBootstrapEvent: "first_chunk_bootstrap",
+    }
+    name = names.get(type(event))
+    if name is None:
+        return None
+    return {"type": name, **dataclasses.asdict(event)}

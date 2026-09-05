@@ -57,7 +57,12 @@ from resonforge.transcribers.muscriptor.execution_profile import (
     MuscriptorExecutionProfile,
     resolve_muscriptor_execution_profile,
 )
-from resonforge.transcribers.muscriptor.quality_plan import MuscriptorQualityPlan
+from resonforge.transcribers.muscriptor.quality_plan import (
+    MuscriptorQualityPlan,
+    diagnostics_payload,
+    hard_pitch_envelope_for,
+    new_chunk_quality_history,
+)
 from resonforge.transcribers.muscriptor.region_producer import (
     ProducerHandoff,
     RegionProducerSession,
@@ -225,7 +230,7 @@ def _prepare_recovery_continuous_work(
     requests: tuple[object, ...],
 ) -> tuple[PreparedWorkItem, ...]:
     """Build recovery session rows and retain role-specific result adapters."""
-    from resonforge.transcribers.muscriptor.quality.policy.recovery_runtime import (
+    from resonforge.transcribers.muscriptor.quality.contract.candidate_execution import (
         complete_recovery_candidate,
         prepare_recovery_candidates,
     )
@@ -626,19 +631,6 @@ def _event_to_jsonl(event: object) -> dict[str, object] | None:
     """Convert one event into the CLI-style JSONL shape."""
     from muscriptor.events import NoteEndEvent, NoteStartEvent
 
-    from resonforge.transcribers.muscriptor.quality.policy.generation_anomaly import (
-        GenerationAnomalyEvent,
-    )
-    from resonforge.transcribers.muscriptor.quality.policy.overlap import (
-        OverlapDiagnosticsEvent,
-    )
-    from resonforge.transcribers.muscriptor.quality.policy.recovery import (
-        RecoveryDiagnosticsEvent,
-    )
-    from resonforge.transcribers.muscriptor.quality.policy.recovery_runtime import (
-        FirstChunkBootstrapEvent,
-    )
-
     if isinstance(event, NoteStartEvent):
         return {"type": "start", **dataclasses.asdict(event)}
     if isinstance(event, NoteEndEvent):
@@ -647,15 +639,7 @@ def _event_to_jsonl(event: object) -> dict[str, object] | None:
             "end_time": event.end_time,
             "start_event_index": event.start_event_index,
         }
-    if isinstance(event, OverlapDiagnosticsEvent):
-        return {"type": "overlap_diagnostics", **dataclasses.asdict(event)}
-    if isinstance(event, GenerationAnomalyEvent):
-        return {"type": "generation_anomaly", **dataclasses.asdict(event)}
-    if isinstance(event, RecoveryDiagnosticsEvent):
-        return {"type": "recovery_diagnostics", **dataclasses.asdict(event)}
-    if isinstance(event, FirstChunkBootstrapEvent):
-        return {"type": "first_chunk_bootstrap", **dataclasses.asdict(event)}
-    return None
+    return diagnostics_payload(event)
 
 
 def load_worker_model(key: ModelKey) -> object:
@@ -1011,17 +995,7 @@ def _transcribe_scheduled(
         recovery_model_name,
         bootstrap_model_name,
     )
-    from resonforge.transcribers.muscriptor.quality.policy.chunk_quality import (
-        DEFAULT_ADAPTIVE_CHUNK_QUALITY_CONFIG,
-        ChunkQualityHistory,
-    )
-    from resonforge.transcribers.muscriptor.quality.policy.generation_guard import (
-        DEFAULT_HARD_PITCH_ENVELOPE,
-    )
-
-    chunk_quality_history = ChunkQualityHistory(
-        DEFAULT_ADAPTIVE_CHUNK_QUALITY_CONFIG.history_size
-    )
+    chunk_quality_history = new_chunk_quality_history()
     completed_chunks = 0
     if progress_callback is not None:
         progress_callback(task.name, 0, total_chunks)
@@ -1045,11 +1019,7 @@ def _transcribe_scheduled(
             first_chunk_model=bootstrap_model_name,
             fresh_reanchor_model=fresh_reanchor_model_name,
             chunk_quality_history=chunk_quality_history,
-            hard_pitch_envelope=(
-                None
-                if task.name in {"other", "drums"}
-                else DEFAULT_HARD_PITCH_ENVELOPE
-            ),
+            hard_pitch_envelope=hard_pitch_envelope_for(task.name),
             trace_collector=trace_collector,
             trace_context_prefix=(export_key, task.name, region_order),
             overlap_probe="overlap-probe" in args.debug_capture,

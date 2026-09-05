@@ -1,4 +1,7 @@
 """How chunks are joined, judged and recovered.
 
-Two importers outside this package: `quality_plan`, which puts it in play, and `transcription`, which still builds the plan's defaults, routes its diagnostics events and prepares recovery candidates for the scheduler -- policy work that has not moved in here yet.
+One importer outside this package: `quality_plan`. Anything a caller needs
+from in here -- the stream, the plan's defaults, the wire shape of a
+diagnostics event -- it asks the plan for, so a policy change never reaches
+the pipeline as a changed import.
 """
