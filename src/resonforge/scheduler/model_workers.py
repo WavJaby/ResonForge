@@ -469,6 +469,58 @@ class _CachedModel(Generic[_ModelT]):
     weight_storage_bytes: int = 0
 
 
+class _IntentQueue:
+    """External mutations, applied at exactly one point in the scheduler's turn.
+
+    Threads that are not the scheduler worker do not touch its state; they hand
+    it a callable. Applying them all at one point is what lets a decided-version
+    difference across an action have only one possible cause -- the
+    single-writer rule.
+
+    ! that rule has no test of its own. It is asserted by this shape and by
+    nothing else, which is worth stating rather than assuming.
+
+    `wake` is a constructor argument because the old call site carried the
+    comment "never separate these" and nothing enforced it: an intent that lands
+    while the worker is parked on its queue and does not wake it is a stall
+    indistinguishable from the hang this scheduler exists to prevent. Inside
+    `enqueue`, the two cannot come apart.
+    """
+
+    def __init__(self, *, wake: Callable[[], None]) -> None:
+        self._wake = wake
+        self._lock = threading.Lock()
+        self._pending: list[tuple[str, Callable[[], None]]] = []
+        #: Read by the liveness report, never by a decision.
+        self.applied = 0
+        self.last_name: str | None = None
+
+    def enqueue(self, name: str, apply: Callable[[], None]) -> None:
+        """Hand one external mutation to the scheduler worker.
+
+        The caller never waits for it: everything an external caller needs back
+        -- a `Future`, usually -- is built in the calling thread before the
+        intent is queued. That is what keeps this from becoming a wait the
+        scheduler cannot see, which is the failure R7 already cost this project.
+        """
+        with self._lock:
+            self._pending.append((name, apply))
+        self._wake()
+
+    def drain(self) -> None:
+        """Apply every queued external mutation. The only place they land."""
+        while True:
+            with self._lock:
+                if not self._pending:
+                    return
+                batch = tuple(self._pending)
+                self._pending.clear()
+            for name, apply in batch:
+                apply()
+                self.applied += 1
+                self.last_name = name
+
+
 class _ModelCache(Generic[_ModelT]):
     """Which model objects this worker holds, and how it gets more.
 
@@ -699,14 +751,11 @@ class ModelWorkerPool(Generic[_ModelT]):
         self._pool_devices: set[str] = set()
         self._capacity_memory_info: tuple[int, int] | None = None
         self._watchdog_started_at: float | None = None
-        # Intents from threads that are not the scheduler worker. They are
-        # applied at exactly one point in the turn (`_drain_intents`), which is
-        # what lets a decided-version difference across an action have only one
-        # possible cause (the single-writer rule).
-        self._intent_lock = threading.Lock()
-        self._pending_intents: list[tuple[str, Callable[[], None]]] = []
-        self._applied_intents = 0
-        self._last_intent_name: str | None = None
+        self._intents = _IntentQueue(
+            wake=lambda: self._queue.put(
+                (float("-inf"), next(self._sequence), self._wake)
+            )
+        )
         self._state_version = 0
         self._measurement_epoch = 0
         self._progress_epoch = 0
@@ -950,7 +999,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         # below reads and writes decided state, so the worker applies it --
         # the single-writer rule. The caller already waits on
         # `bundle_future`, which is where a violation now surfaces.
-        self._enqueue_intent(
+        self._intents.enqueue(
             "submit_batch_group",
             lambda: self._apply_submit_batch_group(
                 claim_token,
@@ -1078,7 +1127,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 self._handle_claim_tokens.pop(parent_handle_key, None)
                 owner.observations["dependency_bundle_parent_wait_consumed"] += 1
             owner.observations["dependency_bundle_admitted"] += 1
-            # No wake: this already runs on the worker `_enqueue_intent` woke.
+            # No wake: this already runs on the worker `_IntentQueue.enqueue` woke.
         bundle_future.add_done_callback(
             lambda completed, bundle_id=bundle_id: self._bundle_future_completed(
                 bundle_id, completed
@@ -1191,7 +1240,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         # reads and writes decided state, so the worker applies it -- the
         # single-writer rule. The caller gets `delivery_future`
         # immediately and waits on that, exactly as before.
-        self._enqueue_intent(
+        self._intents.enqueue(
             "bind_producer_decision_waits",
             lambda: self._apply_bind_producer_decision_waits(
                 handle_keys,
@@ -1351,7 +1400,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         # the single-writer rule. The delivery future is resolved
         # inside the intent, after the mutation, which is what keeps a consumer
         # that waits on it from observing the state from before.
-        self._enqueue_intent(
+        self._intents.enqueue(
             "producer_future_completed",
             lambda: self._apply_producer_future_completed(
                 handle_keys,
@@ -1418,7 +1467,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                     f"stale producer callback has no owner: {unknown}"
                 )
             # No wake needed: this body already runs on the worker that
-            # `_enqueue_intent` woke.
+            # `_IntentQueue.enqueue` woke.
         for delivery_future in delivery_futures:
             if delivery_future.done() or failure is not None:
                 continue
@@ -1699,7 +1748,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         # to carry a violation here, so it reaches the caller the only way it
         # can: `_request_producer_terminal` stops the device, and the caller
         # learns about it through whatever future it is already waiting on.
-        self._enqueue_intent(
+        self._intents.enqueue(
             "release_dependency_claim",
             lambda: self._apply_release_dependency_claim(
                 token,
@@ -1949,37 +1998,9 @@ class ModelWorkerPool(Generic[_ModelT]):
         finally:
             self._worker_stopped.set()
 
-    def _enqueue_intent(self, name: str, apply: Callable[[], None]) -> None:
-        """Hand one external mutation to the scheduler worker.
-
-        The caller never waits for it: everything an external caller needs back
-        -- a `Future`, usually -- is built in the calling thread before the
-        intent is queued. That is what keeps this from becoming a wait the
-        scheduler cannot see, which is the failure R7 already cost this project.
-        """
-        with self._intent_lock:
-            self._pending_intents.append((name, apply))
-        # Never separate these. An intent that lands while the worker is parked
-        # on `self._queue.get(timeout=...)` and does not wake it is a stall that
-        # looks exactly like the hang this scheduler exists to prevent.
-        self._queue.put((float("-inf"), next(self._sequence), self._wake))
-
-    def _drain_intents(self) -> None:
-        """Apply every queued external mutation. The only place they land."""
-        while True:
-            with self._intent_lock:
-                if not self._pending_intents:
-                    return
-                batch = tuple(self._pending_intents)
-                self._pending_intents.clear()
-            for name, apply in batch:
-                apply()
-                self._applied_intents += 1
-                self._last_intent_name = name
-
     def _run_tasks(self) -> None:
         while True:
-            self._drain_intents()
+            self._intents.drain()
             if self._liveness_error is not None:
                 raise self._liveness_error
             if self._requested_terminal_error is not None:
@@ -2217,8 +2238,8 @@ class ModelWorkerPool(Generic[_ModelT]):
                     "changed state cannot reject a stale action "
                     f"(observed={result.observed_version} "
                     f"post={post_state.version} "
-                    f"applied_intents={self._applied_intents} "
-                    f"last_intent={self._last_intent_name})"
+                    f"applied_intents={self._intents.applied} "
+                    f"last_intent={self._intents.last_name})"
                 )
             # The epoch comes from `post_state`, not from the result. A
             # rejection means the decided state did not move, so the world that
