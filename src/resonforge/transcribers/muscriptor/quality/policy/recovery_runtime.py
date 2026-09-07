@@ -1300,6 +1300,86 @@ def _select_candidate(
     return candidate_diagnostics, selected_name, selection_reason
 
 
+def _overlap_probe(
+    stem: _StemContext,
+    chunk: _ChunkContext,
+    *,
+    chunk_tokens: list[int],
+    candidate_states: dict[str, _VerificationCandidateState],
+    fresh: _FreshReanchor | None,
+) -> OverlapProvenanceProbe:
+    """Token provenance of every attempt against the reference, for `--debug-capture`. Pure."""
+    model = stem.model
+    ownership_start = chunk.ownership_start
+    seek = chunk.seek
+    previous_tokens = chunk.previous_tokens
+    previous_seek = chunk.previous_seek
+    verification_start = chunk.verification_start
+    verification_end = chunk.verification_end
+    verification_end_shift = chunk.verification_end_shift
+    prompt_ids = chunk.prompt_ids
+
+    primary_checkpoint, _ = _candidate_checkpoint_prefix(
+        chunk_tokens,
+        model._tokenizer._vocab,
+        verification_end_shift,
+    )
+    probe_candidates = [
+        build_overlap_probe_stream(
+            "primary",
+            chunk_tokens,
+            model._tokenizer._vocab,
+            origin=seek,
+            frame_rate=model._tokenizer.frame_rate,
+            window_start=ownership_start,
+            window_end=verification_end,
+            prompt_tokens=len(prompt_ids),
+            checkpoint_tokens=len(primary_checkpoint),
+        )
+    ]
+    probe_candidates.extend(
+        build_overlap_probe_stream(
+            name,
+            state.tokens,
+            model._tokenizer._vocab,
+            origin=state.origin,
+            frame_rate=model._tokenizer.frame_rate,
+            window_start=ownership_start,
+            window_end=verification_end,
+            prompt_tokens=state.prompt_length,
+            checkpoint_tokens=len(state.evaluation_tokens),
+        )
+        for name, state in candidate_states.items()
+    )
+    if fresh is not None:
+        probe_candidates.append(
+            build_overlap_probe_stream(
+                "fresh_reanchor",
+                fresh.tokens,
+                model._tokenizer._vocab,
+                origin=ownership_start,
+                frame_rate=model._tokenizer.frame_rate,
+                window_start=ownership_start,
+                window_end=verification_end,
+            )
+        )
+    return OverlapProvenanceProbe(
+        window_start=ownership_start,
+        verification_start=verification_start,
+        verification_end=verification_end,
+        reference=build_overlap_probe_stream(
+            "reference",
+            previous_tokens,
+            model._tokenizer._vocab,
+            origin=previous_seek,
+            frame_rate=model._tokenizer.frame_rate,
+            window_start=ownership_start,
+            window_end=verification_end,
+        ),
+        candidates=tuple(probe_candidates),
+    )
+
+
 def _recovery_disabled(
     stem: _StemContext,
     config: _RecoveryConfig,
@@ -1418,11 +1498,8 @@ def _recover_chunk(
     ownership_start = chunk.ownership_start
     seek = chunk.seek
     next_seek = chunk.next_seek
-    previous_tokens = chunk.previous_tokens
-    previous_seek = chunk.previous_seek
     verification_start = chunk.verification_start
     verification_end = chunk.verification_end
-    verification_end_shift = chunk.verification_end_shift
     prompt_ids = chunk.prompt_ids
     primary_handle = primary.primary_handle
     primary_diagnostic = primary.primary_diagnostic
@@ -1437,11 +1514,6 @@ def _recover_chunk(
     accepted_chunk_quality = outcome.accepted_chunk_quality
     ended = outcome.ended
     force_reflow = outcome.force_reflow
-    primary_summary = outcome.primary_summary
-    primary_chunk_quality = outcome.primary_chunk_quality
-    primary_chunk_action = outcome.primary_chunk_action
-    primary_chunk_findings = outcome.primary_chunk_findings
-    primary_chunk_assessment = outcome.primary_chunk_assessment
 
     safe_frontier_source = None
     safe_frontier_time: float | None = None
@@ -1489,11 +1561,6 @@ def _recover_chunk(
             primary_handle = primary.primary_handle
             primary_diagnostic = primary.primary_diagnostic
             ended = outcome.ended
-            primary_summary = outcome.primary_summary
-            primary_chunk_quality = outcome.primary_chunk_quality
-            primary_chunk_action = outcome.primary_chunk_action
-            primary_chunk_findings = outcome.primary_chunk_findings
-            primary_chunk_assessment = outcome.primary_chunk_assessment
         attempted_names, candidate_names = yield from _attempt_candidates(
             stem,
             chunk,
@@ -1567,7 +1634,7 @@ def _recover_chunk(
         elif selected_name == "primary":
             selected_tokens = chunk_tokens
             selected_origin = seek
-            accepted_chunk_quality = primary_chunk_quality
+            accepted_chunk_quality = outcome.primary_chunk_quality
         elif selected_name == "fresh_reanchor":
             assert fresh is not None
             selected_tokens = fresh.tokens
@@ -1627,67 +1694,17 @@ def _recover_chunk(
             ),
             None,
         )
-        overlap_probe = None
-        if overlap_probe_enabled:
-            primary_checkpoint, _ = _candidate_checkpoint_prefix(
-                chunk_tokens,
-                model._tokenizer._vocab,
-                verification_end_shift,
+        overlap_probe = (
+            _overlap_probe(
+                stem,
+                chunk,
+                chunk_tokens=chunk_tokens,
+                candidate_states=candidate_states,
+                fresh=fresh,
             )
-            probe_candidates = [
-                build_overlap_probe_stream(
-                    "primary",
-                    chunk_tokens,
-                    model._tokenizer._vocab,
-                    origin=seek,
-                    frame_rate=model._tokenizer.frame_rate,
-                    window_start=ownership_start,
-                    window_end=verification_end,
-                    prompt_tokens=len(prompt_ids),
-                    checkpoint_tokens=len(primary_checkpoint),
-                )
-            ]
-            probe_candidates.extend(
-                build_overlap_probe_stream(
-                    name,
-                    state.tokens,
-                    model._tokenizer._vocab,
-                    origin=state.origin,
-                    frame_rate=model._tokenizer.frame_rate,
-                    window_start=ownership_start,
-                    window_end=verification_end,
-                    prompt_tokens=state.prompt_length,
-                    checkpoint_tokens=len(state.evaluation_tokens),
-                )
-                for name, state in candidate_states.items()
-            )
-            if fresh is not None:
-                probe_candidates.append(
-                    build_overlap_probe_stream(
-                        "fresh_reanchor",
-                        fresh.tokens,
-                        model._tokenizer._vocab,
-                        origin=ownership_start,
-                        frame_rate=model._tokenizer.frame_rate,
-                        window_start=ownership_start,
-                        window_end=verification_end,
-                    )
-                )
-            overlap_probe = OverlapProvenanceProbe(
-                window_start=ownership_start,
-                verification_start=verification_start,
-                verification_end=verification_end,
-                reference=build_overlap_probe_stream(
-                    "reference",
-                    previous_tokens,
-                    model._tokenizer._vocab,
-                    origin=previous_seek,
-                    frame_rate=model._tokenizer.frame_rate,
-                    window_start=ownership_start,
-                    window_end=verification_end,
-                ),
-                candidates=tuple(probe_candidates),
-            )
+            if overlap_probe_enabled
+            else None
+        )
         recovery_event = RecoveryDiagnosticsEvent(
             chunk_index=chunk_index,
             seek_time=ownership_start,
@@ -1738,7 +1755,9 @@ def _recover_chunk(
     elif trigger_reason is not None:
         return _recovery_disabled(stem, config, chunk, primary, outcome)
 
-    return _ChunkOutcome(
+    # The primary verdict fields ride through untouched: `_resume_primary` already replaced them on `outcome`.
+    return replace(
+        outcome,
         selected_tokens=selected_tokens,
         selected_reference_tokens=selected_reference_tokens,
         selected_reference_origin=selected_reference_origin,
@@ -1746,11 +1765,6 @@ def _recover_chunk(
         accepted_chunk_quality=accepted_chunk_quality,
         ended=ended,
         force_reflow=force_reflow,
-        primary_summary=primary_summary,
-        primary_chunk_quality=primary_chunk_quality,
-        primary_chunk_action=primary_chunk_action,
-        primary_chunk_findings=primary_chunk_findings,
-        primary_chunk_assessment=primary_chunk_assessment,
         recovery_event=recovery_event,
     )
 
