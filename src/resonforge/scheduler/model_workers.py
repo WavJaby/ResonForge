@@ -469,6 +469,114 @@ class _CachedModel(Generic[_ModelT]):
     weight_storage_bytes: int = 0
 
 
+class _ModelCache(Generic[_ModelT]):
+    """Which model objects this worker holds, and how it gets more.
+
+    The first of `ModelWorkerPool`'s field groups to get an owner. Two fields,
+    four methods, and one dependency on the rest of the class -- offloading has
+    to leave alone whatever a live session is decoding with.
+
+    That dependency is a **constructor argument, not a reach into the pool**:
+    `resident_identities` is the whole of what offloading needs to know about
+    runs, so naming it here is what stops the cache from growing a second view
+    of the scheduler's state.
+    """
+
+    def __init__(
+        self,
+        loader: Callable[[ModelKey], _ModelT],
+        *,
+        resident_identities: Callable[[], set[ModelIdentity]],
+    ) -> None:
+        self._loader = loader
+        self._resident_identities = resident_identities
+        self.by_identity: dict[ModelIdentity, _CachedModel[_ModelT]] = {}
+
+    def model_for(self, key: ModelKey) -> tuple[_ModelT, bool]:
+        """The model for this key, and whether this call is what loaded it."""
+        cached = self.by_identity.get(key.identity)
+        if cached is not None:
+            if cached.key.execution_profile != key.execution_profile:
+                raise RuntimeError(
+                    "one model identity requested conflicting execution profiles"
+                )
+            self._activate(key, cached.model)
+            return cached.model, False
+        model, load_growth_bytes = self._load(key)
+        self.by_identity[key.identity] = _CachedModel(
+            key,
+            model,
+            load_growth_bytes=load_growth_bytes,
+            weight_storage_bytes=_model_weight_storage_bytes(model),
+        )
+        return model, True
+
+    def _load(self, key: ModelKey) -> tuple[_ModelT, int]:
+        def load_once() -> tuple[_ModelT, int]:
+            baseline: int | None = None
+            device = torch.device(key.device)
+            if device.type == "cuda":
+                try:
+                    torch.cuda.synchronize(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                    baseline = allocator_reserved_bytes(device)
+                except (AssertionError, RuntimeError, ValueError):
+                    baseline = None
+            model = self._loader(key)
+            if baseline is None:
+                return model, 0
+            torch.cuda.synchronize(device)
+            return model, max(
+                0,
+                allocator_reserved_bytes(device) - baseline,
+            )
+
+        try:
+            return load_once()
+        except torch.cuda.OutOfMemoryError:
+            if not self.offload():
+                raise
+            torch.cuda.empty_cache()
+            return load_once()
+
+    def _activate(self, key: ModelKey, model: _ModelT) -> None:
+        move_to = getattr(model, "move_to", None)
+        current_device = getattr(model, "_device", None)
+        if (
+            move_to is None
+            or current_device is None
+            or str(current_device) == key.device
+        ):
+            return
+        try:
+            move_to(key.device)
+        except torch.cuda.OutOfMemoryError:
+            self.offload(exclude=key)
+            torch.cuda.empty_cache()
+            move_to(key.device)
+
+    def offload(self, *, exclude: ModelKey | None = None) -> bool:
+        """Move every model to the host except the excluded and the resident."""
+        moved = False
+        excluded_identity = None if exclude is None else exclude.identity
+        resident = self._resident_identities()
+        for identity, cached in self.by_identity.items():
+            if identity == excluded_identity or identity in resident:
+                continue
+            cached_model = cached.model
+            move_to = getattr(cached_model, "move_to", None)
+            current_device = getattr(cached_model, "_device", None)
+            if (
+                move_to is None
+                or current_device is None
+                or str(current_device) == "cpu"
+            ):
+                continue
+            move_to("cpu")
+            moved = True
+        return moved
+
+
 def _resident_model_bytes(cached: _CachedModel[Any] | None) -> int:
     """Return what a loaded model keeps, not what loading it briefly cost.
 
@@ -556,13 +664,23 @@ class ModelWorkerPool(Generic[_ModelT]):
         device: str | None = None,
         device_terminal: Callable[[str, BaseException], None] | None = None,
     ) -> None:
-        self._loader = loader
         self._stop_event = stop_event
         self._queue: queue.PriorityQueue[tuple[float, int, object]] = (
             queue.PriorityQueue()
         )
         self._sequence = itertools.count()
-        self._models: dict[ModelIdentity, _CachedModel[_ModelT]] = {}
+        # A lane holding a live session is decoding out of its model, so
+        # offloading has to skip it. That is the whole of what the cache needs
+        # from the runs, and passing it as a callable is what keeps the cache
+        # from growing a second view of scheduler state.
+        self._models: _ModelCache[_ModelT] = _ModelCache(
+            loader,
+            resident_identities=lambda: {
+                run.key.identity
+                for run in self._persistent_runs.values()
+                if run.session is not None
+            },
+        )
         # Last observed KV-pool shortfall totals per device, so a monotone
         # counter is reported as a delta rather than re-summed each sample.
         self._kv_shortfall_baseline: dict[str, tuple[int, int]] = {}
@@ -1960,7 +2078,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 try:
                     with self._execution_lock:
                         model_started = time.perf_counter()
-                        model, model_loaded = self._model_for(task.key)
+                        model, model_loaded = self._models.model_for(task.key)
                         model_finished = time.perf_counter()
                         if task.trace_model_load:
                             self._record_model_resource_span(
@@ -2727,7 +2845,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                     state.version,
                 )
             model_started = time.perf_counter()
-            model, loaded = self._model_for(run.key)
+            model, loaded = self._models.model_for(run.key)
             model_finished = time.perf_counter()
             model_elapsed = model_finished - model_started
             if loaded or model_elapsed >= 0.05:
@@ -4206,7 +4324,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                     or not resident_ids_by_identity[identity].issubset(donor_ids)
                 ):
                     continue
-                cached = self._models.get(identity)
+                cached = self._models.by_identity.get(identity)
                 if cached is None:
                     continue
                 current_device = getattr(cached.model, "_device", None)
@@ -5010,13 +5128,13 @@ class ModelWorkerPool(Generic[_ModelT]):
         for donor in donors:
             self._release_idle_session(donor)
         gc.collect()
-        self._offload_models(exclude=target.key)
+        self._models.offload(exclude=target.key)
         if device.type == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.synchronize(device)
 
         model_started = time.perf_counter()
-        model, loaded = self._model_for(target.key)
+        model, loaded = self._models.model_for(target.key)
         model_finished = time.perf_counter()
         # The donors are closed and the device re-read, so the same one
         # comparison that authorised this action has to still hold. It is the
@@ -5576,7 +5694,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         succeeded = False
         model_loaded = False
         try:
-            model, model_loaded = self._model_for(key)
+            model, model_loaded = self._models.model_for(key)
             result = operation(model)
             succeeded = True
             return result
@@ -5596,92 +5714,6 @@ class ModelWorkerPool(Generic[_ModelT]):
             with self._state_lock:
                 self._observer.task_completed(timing)
 
-    def _model_for(self, key: ModelKey) -> tuple[_ModelT, bool]:
-        cached = self._models.get(key.identity)
-        if cached is not None:
-            if cached.key.execution_profile != key.execution_profile:
-                raise RuntimeError(
-                    "one model identity requested conflicting execution profiles"
-                )
-            self._activate_model(key, cached.model)
-            return cached.model, False
-        model, load_growth_bytes = self._load_model(key)
-        self._models[key.identity] = _CachedModel(
-            key,
-            model,
-            load_growth_bytes=load_growth_bytes,
-            weight_storage_bytes=_model_weight_storage_bytes(model),
-        )
-        return model, True
-
-
-    def _load_model(self, key: ModelKey) -> tuple[_ModelT, int]:
-        def load_once() -> tuple[_ModelT, int]:
-            baseline: int | None = None
-            device = torch.device(key.device)
-            if device.type == "cuda":
-                try:
-                    torch.cuda.synchronize(device)
-                    torch.cuda.reset_peak_memory_stats(device)
-                    baseline = allocator_reserved_bytes(device)
-                except (AssertionError, RuntimeError, ValueError):
-                    baseline = None
-            model = self._loader(key)
-            if baseline is None:
-                return model, 0
-            torch.cuda.synchronize(device)
-            return model, max(
-                0,
-                allocator_reserved_bytes(device) - baseline,
-            )
-
-        try:
-            return load_once()
-        except torch.cuda.OutOfMemoryError:
-            if not self._offload_models():
-                raise
-            torch.cuda.empty_cache()
-            return load_once()
-
-    def _activate_model(self, key: ModelKey, model: _ModelT) -> None:
-        move_to = getattr(model, "move_to", None)
-        current_device = getattr(model, "_device", None)
-        if (
-            move_to is None
-            or current_device is None
-            or str(current_device) == key.device
-        ):
-            return
-        try:
-            move_to(key.device)
-        except torch.cuda.OutOfMemoryError:
-            self._offload_models(exclude=key)
-            torch.cuda.empty_cache()
-            move_to(key.device)
-
-    def _offload_models(self, *, exclude: ModelKey | None = None) -> bool:
-        moved = False
-        excluded_identity = None if exclude is None else exclude.identity
-        resident_identities = {
-            run.key.identity
-            for run in self._persistent_runs.values()
-            if run.session is not None
-        }
-        for identity, cached in self._models.items():
-            if identity == excluded_identity or identity in resident_identities:
-                continue
-            cached_model = cached.model
-            move_to = getattr(cached_model, "move_to", None)
-            current_device = getattr(cached_model, "_device", None)
-            if (
-                move_to is None
-                or current_device is None
-                or str(current_device) == "cpu"
-            ):
-                continue
-            move_to("cpu")
-            moved = True
-        return moved
 
     def _watch_stop_event(self) -> None:
         assert self._stop_event is not None
