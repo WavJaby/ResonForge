@@ -7,7 +7,7 @@ import math
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -86,9 +86,6 @@ from resonforge.transcribers.muscriptor.quality.policy.recovery import (
 
 SecondaryCandidate = Literal["secondary_model", "new_seed"]
 RecoverySelection = Literal["checkpoint", "completed_quality"]
-
-if TYPE_CHECKING:
-    pass
 
 _SAMPLE_RATE = 16000
 _SEGMENT_DURATION = 5.0

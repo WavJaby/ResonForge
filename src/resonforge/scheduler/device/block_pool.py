@@ -391,7 +391,7 @@ class DeviceBlockPool:
 
     def note_division(
         self,
-        lane: str,
+        model: str,
         *,
         free_bytes: int,
         add_back_bytes: int,
@@ -400,7 +400,7 @@ class DeviceBlockPool:
         divisible_bytes: int,
         spare_bytes: int,
     ) -> None:
-        """Record the inputs of the division that just bound this lane's supply.
+        """Record the inputs of the division that just bound this lane's supply. Keyed by `model`, like `lane()`.
 
         Only the BINDING one. `_declare_kv_pool` divides twice -- once at the
         price it will charge and once against what the measurements imply
@@ -412,7 +412,7 @@ class DeviceBlockPool:
         was decided from, since width never narrows afterwards.
         """
         with self._lock:
-            self._division_by_lane[str(lane)] = {
+            self._division_by_lane[str(model)] = {
                 "free_bytes": int(free_bytes),
                 "add_back_bytes": int(add_back_bytes),
                 "process_reserve_bytes": int(process_reserve_bytes),
@@ -421,15 +421,15 @@ class DeviceBlockPool:
                 "spare_bytes": int(spare_bytes),
             }
 
-    def division_report(self, lane: str) -> dict[str, int] | None:
-        """What the last binding division for `lane` was handed, or None.
+    def division_report(self, model: str) -> dict[str, int] | None:
+        """What the last binding division for `model`'s lane was handed, or None.
 
         None means no declaration has happened on this lane yet -- distinct
         from a division that happened and saw zero, which is what the
         histograms this replaces could not say apart.
         """
         with self._lock:
-            recorded = self._division_by_lane.get(str(lane))
+            recorded = self._division_by_lane.get(str(model))
             return dict(recorded) if recorded is not None else None
 
     def bootstrap_pricing_report(self) -> dict[str, object]:
