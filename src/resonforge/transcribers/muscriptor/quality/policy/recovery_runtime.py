@@ -6,7 +6,7 @@ import logging
 import math
 import warnings
 from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -845,16 +845,10 @@ class _SafeFrontier:
 def _safe_frontier(
     stem: _StemContext,
     chunk: _ChunkContext,
-    *,
-    primary_diagnostic: RecoveryCandidateDiagnostics,
-    chunk_tokens: list[int],
-    candidate_states: dict[str, _VerificationCandidateState],
-    candidate_names: list[str],
-    checkpoint_selected_name: str | None,
+    primary: _PrimaryOutcome,
+    recovery: _Recovery,
 ) -> _SafeFrontier | None:
-    """When no attempt is reference-eligible, the first attempt in preference order whose safe frontier reaches past the verification window.
-
-    Pure. `primary_diagnostic` and `chunk_tokens` are the values AFTER any primary continuation, not `primary`'s, which is why they are passed and not read off the context."""
+    """When no attempt is reference-eligible, the first attempt in preference order whose safe frontier reaches past the verification window. Pure; `primary` is the post-continuation one."""
     model = stem.model
     recovery_selection = stem.recovery_selection
     audio_duration = stem.audio_duration
@@ -863,6 +857,11 @@ def _safe_frontier(
     next_seek = chunk.next_seek
     verification_end = chunk.verification_end
     prompt_ids = chunk.prompt_ids
+    primary_diagnostic = primary.primary_diagnostic
+    chunk_tokens = primary.chunk_tokens
+    candidate_states = recovery.candidate_states
+    candidate_names = recovery.candidate_names
+    checkpoint_selected_name = recovery.checkpoint_selected_name
 
     frontier_names = (
         # Every completed attempt is frontier material, the winner
@@ -1025,18 +1024,43 @@ def _resume_primary(
     )
 
 
+@dataclass
+class _Recovery:
+    """One chunk's recovery as the stages advance it. Mutable on purpose: each stage writes the decision it owns and the next reads it.
+
+    Stage order and what each writes: `_verify_at_checkpoint` -> `candidate_states`; checkpoint selection -> `checkpoint_selected_name`; `_attempt_candidates` -> `attempted_names`, `candidate_names` (attempt order == preference order); `_select_candidate` -> `candidate_diagnostics`, `selected_name`, `selection_reason`; the frontier and fresh stages -> `frontier` / `fresh` and, when they win, the selection; `_settle` -> `selected_origin`, `ownership_end`."""
+
+    pair: _CandidatePair
+    candidate_states: dict[str, _VerificationCandidateState]
+    checkpoint_selected_name: str | None = None
+    attempted_names: set[str] = field(default_factory=set)
+    candidate_names: list[str] = field(default_factory=list)
+    candidate_diagnostics: list[RecoveryCandidateDiagnostics] = field(default_factory=list)
+    selected_name: str | None = None
+    selection_reason: str = "fresh_reanchor_required"
+    frontier: _SafeFrontier | None = None
+    fresh: _FreshReanchor | None = None
+    selected_origin: float | None = None
+    ownership_end: float | None = None
+
+    @property
+    def secondary_name(self) -> str:
+        return self.pair.secondary_name
+
+    @property
+    def seed(self) -> int:
+        return self.pair.seed
+
+
 def _attempt_candidates(
     stem: _StemContext,
     chunk: _ChunkContext,
-    *,
-    candidate_states: dict[str, _VerificationCandidateState],
-    checkpoint_selected_name: str | None,
-    primary_diagnostic: RecoveryCandidateDiagnostics,
-    secondary_name: str,
+    primary: _PrimaryOutcome,
+    recovery: _Recovery,
 ) -> Iterator[object]:
     """Resume the candidates in preference order until one survives as a completed chunk.
 
-    Mutates `candidate_states` in place (tokens, handle, diagnostic, `chunk_quality_safe`). Returns `(attempted_names, candidate_names)`: the second is attempt order, which is preference order by construction, and the selection stage reads it as such."""
+    Mutates `candidate_states` in place (tokens, handle, diagnostic, `chunk_quality_safe`) and writes `attempted_names` / `candidate_names`. `primary` is the post-continuation one."""
     model = stem.model
     recovery_selection = stem.recovery_selection
     chunk_quality_history = stem.chunk_quality_history
@@ -1044,6 +1068,10 @@ def _attempt_candidates(
     recovery_quality_guard = stem.recovery_quality_guard
     ownership_start = chunk.ownership_start
     next_seek = chunk.next_seek
+    primary_diagnostic = primary.primary_diagnostic
+    candidate_states = recovery.candidate_states
+    checkpoint_selected_name = recovery.checkpoint_selected_name
+    secondary_name = recovery.secondary_name
 
     attempted_names: set[str] = set()
 
@@ -1201,21 +1229,22 @@ def _attempt_candidates(
             # eligible one is still paused at its checkpoint -- try it
             # before settling for a frontier prefix or a discard.
             candidate_names.extend(_fallback_candidates()[:1])
-    return attempted_names, candidate_names
+    recovery.attempted_names = attempted_names
+    recovery.candidate_names = candidate_names
 
 
 def _discard_losers(
     stem: _StemContext,
-    *,
-    candidate_states: dict[str, _VerificationCandidateState],
-    attempted_names: set[str],
-    secondary_name: str,
     primary: _PrimaryOutcome,
+    recovery: _Recovery,
 ) -> Iterator[object]:
     """Release every paused row still held and close the primary generation. Mutates `candidate_states`; a candidate never resumed after its checkpoint is marked so."""
     model = stem.model
     primary_handle = primary.primary_handle
     primary_generation = primary.primary_generation
+    candidate_states = recovery.candidate_states
+    attempted_names = recovery.attempted_names
+    secondary_name = recovery.secondary_name
 
     for name in ("shifted_replay", secondary_name):
         state = candidate_states[name]
@@ -1247,16 +1276,17 @@ def _discard_losers(
 
 def _select_candidate(
     stem: _StemContext,
-    *,
-    candidate_states: dict[str, _VerificationCandidateState],
-    secondary_name: str,
-    checkpoint_selected_name: str | None,
-    attempted_names: set[str],
-    candidate_names: list[str],
-    primary_diagnostic: RecoveryCandidateDiagnostics,
-) -> tuple[list[RecoveryCandidateDiagnostics], str | None, str]:
-    """Pick the chunk's owner among the completed attempts. Pure. Returns `(candidate_diagnostics, selected_name, selection_reason)`; a None name means no attempt is reference-eligible and the frontier / fresh stages follow."""
+    primary: _PrimaryOutcome,
+    recovery: _Recovery,
+) -> None:
+    """Pick the chunk's owner among the completed attempts. Writes `candidate_diagnostics`, `selected_name`, `selection_reason`; a None name means no attempt is reference-eligible and the frontier / fresh stages follow."""
     recovery_selection = stem.recovery_selection
+    primary_diagnostic = primary.primary_diagnostic
+    candidate_states = recovery.candidate_states
+    secondary_name = recovery.secondary_name
+    checkpoint_selected_name = recovery.checkpoint_selected_name
+    attempted_names = recovery.attempted_names
+    candidate_names = recovery.candidate_names
 
     candidate_diagnostics = [
         primary_diagnostic,
@@ -1297,19 +1327,22 @@ def _select_candidate(
         "shifted_replay": "shifted_replay_reference_eligible",
         "primary": "primary_reference_eligible",
     }.get(selected_name, "fresh_reanchor_required")
-    return candidate_diagnostics, selected_name, selection_reason
+    recovery.candidate_diagnostics = candidate_diagnostics
+    recovery.selected_name = selected_name
+    recovery.selection_reason = selection_reason
 
 
 def _overlap_probe(
     stem: _StemContext,
     chunk: _ChunkContext,
-    *,
-    chunk_tokens: list[int],
-    candidate_states: dict[str, _VerificationCandidateState],
-    fresh: _FreshReanchor | None,
+    primary: _PrimaryOutcome,
+    recovery: _Recovery,
 ) -> OverlapProvenanceProbe:
     """Token provenance of every attempt against the reference, for `--debug-capture`. Pure."""
     model = stem.model
+    chunk_tokens = primary.chunk_tokens
+    candidate_states = recovery.candidate_states
+    fresh = recovery.fresh
     ownership_start = chunk.ownership_start
     seek = chunk.seek
     previous_tokens = chunk.previous_tokens
@@ -1467,295 +1500,90 @@ def _recovery_disabled(
     )
 
 
-def _recover_chunk(
+def _settle(
     stem: _StemContext,
-    config: _RecoveryConfig,
     chunk: _ChunkContext,
     primary: _PrimaryOutcome,
     outcome: _ChunkOutcome,
-) -> Iterator[object]:
-    """Decide what this chunk emits when the primary attempt is not trusted.
+    recovery: _Recovery,
+) -> _ChunkOutcome:
+    """Turn the selected attempt into the chunk's output: tokens canonicalised to the ownership window, the reference the next chunk verifies against, and where ownership ends.
 
-    A generator, and the caller delegates with `yield from`: seven of
-    `forcing_stream`'s seventeen yield points are in here, and the driver
-    (`region_producer.advance`) pairs every request with exactly one
-    `send()`. Delegation is transcript-identical to the inline branch this
-    replaces, including the path that yields nothing at all --
-    `docs/run-evidence/yieldfrom-delegation-probe-260906.py`.
-
-    The body is that branch verbatim. Names are rebound below rather than
-    reached through their group, so the 945 lines could move without also
-    being rewritten -- one variable, not two."""
+    Writes `recovery.selected_origin` / `ownership_end` for the event. A safe frontier is the one case whose tokens are already canonicalised and whose reference end is the frontier, not the segment end."""
     model = stem.model
     wav = stem.wav
-    recovery_selection = stem.recovery_selection
-    recovery_enabled = stem.recovery_enabled
     audio_duration = stem.audio_duration
-    recovery_seed = config.recovery_seed
-    fresh_reanchor = config.fresh_reanchor
-    overlap_probe_enabled = config.overlap_probe_enabled
-    chunk_index = chunk.chunk_index
     ownership_start = chunk.ownership_start
     seek = chunk.seek
     next_seek = chunk.next_seek
-    verification_start = chunk.verification_start
-    verification_end = chunk.verification_end
-    prompt_ids = chunk.prompt_ids
-    primary_handle = primary.primary_handle
-    primary_diagnostic = primary.primary_diagnostic
-    primary_match = primary.primary_match
-    trigger_reason = primary.trigger_reason
-    chunk_tokens = primary.chunk_tokens
-
-    selected_tokens = outcome.selected_tokens
-    selected_reference_tokens = outcome.selected_reference_tokens
-    selected_reference_origin = outcome.selected_reference_origin
-    selected_reference_end = outcome.selected_reference_end
-    accepted_chunk_quality = outcome.accepted_chunk_quality
+    selected_name = recovery.selected_name
     ended = outcome.ended
     force_reflow = outcome.force_reflow
 
-    safe_frontier_source = None
-    safe_frontier_time: float | None = None
-
-    recovery_event: RecoveryDiagnosticsEvent | None = None
-    if recovery_enabled and trigger_reason is not None:
-        pair = _candidate_pair(stem, config, chunk)
-        seed = pair.seed
-        secondary_name = pair.secondary_name
-        shifted_request = pair.shifted_request
-        secondary_request = pair.secondary_request
-
-        recovery_results = yield RecoveryCandidateGroupRequest(
-            (shifted_request, secondary_request),
-            parent_resident_handle=primary_handle,
-        )
-        candidate_states = _verify_at_checkpoint(stem, chunk, pair, recovery_results)
-
-        assert primary_diagnostic is not None
-        checkpoint_selection = select_checkpoint_candidate(
-            primary_diagnostic,
-            (
-                candidate_states["shifted_replay"].diagnostic,
-                candidate_states[secondary_name].diagnostic,
-            ),
-        )
-        checkpoint_selected_name = (
-            checkpoint_selection.name
-            if checkpoint_selection is not None
+    if selected_name == "discarded":
+        selected_tokens = model._tokenizer.tie_section_token_ids([])
+        selected_origin = ownership_start
+        ended = True
+        accepted_chunk_quality = None
+    elif selected_name == "primary":
+        selected_tokens = primary.chunk_tokens
+        selected_origin = seek
+        accepted_chunk_quality = outcome.primary_chunk_quality
+    elif selected_name == "fresh_reanchor":
+        assert recovery.fresh is not None
+        selected_tokens = recovery.fresh.tokens
+        selected_origin = ownership_start
+        ended = recovery.fresh.ended
+        accepted_chunk_quality = recovery.fresh.quality
+    elif selected_name == "safe_frontier":
+        assert recovery.frontier is not None
+        frontier = recovery.frontier
+        selected_tokens = frontier.tokens
+        selected_origin = frontier.reference_origin
+        ended = True
+        force_reflow = frontier.time < audio_duration - 1e-9
+        accepted_chunk_quality = None
+    else:
+        assert selected_name is not None
+        selected_state = recovery.candidate_states[selected_name]
+        selected_tokens = selected_state.tokens
+        selected_origin = selected_state.origin
+        ended = selected_state.ended
+        accepted_chunk_quality = (
+            selected_state.diagnostic.chunk_quality
+            if selected_state.chunk_quality_safe
             else None
         )
-        # The checkpoint winner resumes first; the losers' paused KV is
-        # kept until every attempt is over (the discard block below), so a
-        # winner whose CONTINUATION fails terminally can be replaced by
-        # the next checkpoint-eligible candidate instead of ending as a
-        # frontier prefix or a discarded chunk. Owner-directed 2026-08-29;
-        # measured pool: 57 discarded + 23 frontier of 2053 decisions.
-        if (
-            recovery_selection == "checkpoint"
-            and checkpoint_selected_name == "primary"
-            and primary_handle is not None
-        ):
-            primary, outcome = yield from _resume_primary(stem, chunk, primary, outcome)
-            chunk_tokens = primary.chunk_tokens
-            primary_handle = primary.primary_handle
-            primary_diagnostic = primary.primary_diagnostic
-            ended = outcome.ended
-        attempted_names, candidate_names = yield from _attempt_candidates(
-            stem,
-            chunk,
-            candidate_states=candidate_states,
-            checkpoint_selected_name=checkpoint_selected_name,
-            primary_diagnostic=primary_diagnostic,
-            secondary_name=secondary_name,
-        )
-        yield from _discard_losers(
-            stem,
-            candidate_states=candidate_states,
-            attempted_names=attempted_names,
-            secondary_name=secondary_name,
-            primary=primary,
-        )
-        candidate_diagnostics, selected_name, selection_reason = _select_candidate(
-            stem,
-            candidate_states=candidate_states,
-            secondary_name=secondary_name,
-            checkpoint_selected_name=checkpoint_selected_name,
-            attempted_names=attempted_names,
-            candidate_names=candidate_names,
-            primary_diagnostic=primary_diagnostic,
-        )
 
-        if selected_name is None:
-            frontier = _safe_frontier(
-                stem,
-                chunk,
-                primary_diagnostic=primary_diagnostic,
-                chunk_tokens=chunk_tokens,
-                candidate_states=candidate_states,
-                candidate_names=candidate_names,
-                checkpoint_selected_name=checkpoint_selected_name,
-            )
-            if frontier is not None:
-                safe_frontier_time = frontier.time
-                selected_reference_tokens = frontier.reference_tokens
-                selected_reference_origin = frontier.reference_origin
-                selected_reference_end = frontier.time
-                selected_tokens = frontier.tokens
-                selected_name = "safe_frontier"
-                selection_reason = "safe_frontier_prefix_retained"
-                safe_frontier_source = frontier.source
-                force_reflow = (
-                    safe_frontier_time < audio_duration - 1e-9
-                )
-                ended = True
-                accepted_chunk_quality = None
-
-        fresh: _FreshReanchor | None = None
-        # Disabling fresh re-anchor makes this chunk a discard instead.
-        if selected_name is None and fresh_reanchor:
-            fresh = yield from _fresh_reanchor(stem, config, chunk)
-            candidate_diagnostics.append(fresh.diagnostic)
-            if fresh.eligible:
-                selected_name = "fresh_reanchor"
-                selection_reason = "fresh_reanchor_reference_eligible"
-
-        if selected_name is None:
-            selected_name = "discarded"
-            selection_reason = (
-                "fresh_reanchor_rejected_chunk_discarded"
-                if fresh_reanchor
-                else "fresh_reanchor_disabled_chunk_discarded"
-            )
-            selected_tokens = model._tokenizer.tie_section_token_ids([])
-            selected_origin = ownership_start
-            ended = True
-            accepted_chunk_quality = None
-        elif selected_name == "primary":
-            selected_tokens = chunk_tokens
-            selected_origin = seek
-            accepted_chunk_quality = outcome.primary_chunk_quality
-        elif selected_name == "fresh_reanchor":
-            assert fresh is not None
-            selected_tokens = fresh.tokens
-            selected_origin = ownership_start
-            ended = fresh.ended
-            accepted_chunk_quality = fresh.quality
-        elif selected_name == "safe_frontier":
-            assert selected_reference_tokens is not None
-            assert selected_reference_origin is not None
-            assert selected_reference_end is not None
-            accepted_chunk_quality = None
-        else:
-            selected_state = candidate_states[selected_name]
-            selected_tokens = selected_state.tokens
-            selected_origin = selected_state.origin
-            ended = selected_state.ended
-            accepted_chunk_quality = (
-                selected_state.diagnostic.chunk_quality
-                if selected_state.chunk_quality_safe
-                else None
-            )
-
-        if selected_name == "safe_frontier":
-            assert selected_reference_end is not None
-            ownership_end = min(
-                next_seek or audio_duration,
-                selected_reference_end,
-            )
-        else:
-            selected_reference_tokens = selected_tokens
-            selected_reference_origin = selected_origin
-            selected_reference_end = min(
-                selected_origin + _SEGMENT_DURATION,
-                wav.shape[-1] / _SAMPLE_RATE,
-            )
-            ownership_end = min(
-                next_seek or audio_duration,
-                selected_reference_end,
-            )
-            selected_tokens = overlap_runtime.canonicalize_tokens(
-                model._tokenizer,
-                selected_tokens,
-                selected_origin,
-                ownership_start,
-                ownership_end,
-            )
-        selected_diagnostic = next(
-            (
-                candidate
-                for candidate in candidate_diagnostics
-                if candidate.name
-                == (
-                    safe_frontier_source
-                    if selected_name == "safe_frontier"
-                    else selected_name
-                )
-            ),
-            None,
+    if selected_name == "safe_frontier":
+        assert recovery.frontier is not None
+        selected_reference_tokens = recovery.frontier.reference_tokens
+        selected_reference_origin = recovery.frontier.reference_origin
+        selected_reference_end = recovery.frontier.time
+        ownership_end = min(
+            next_seek or audio_duration,
+            selected_reference_end,
         )
-        overlap_probe = (
-            _overlap_probe(
-                stem,
-                chunk,
-                chunk_tokens=chunk_tokens,
-                candidate_states=candidate_states,
-                fresh=fresh,
-            )
-            if overlap_probe_enabled
-            else None
+    else:
+        selected_reference_tokens = selected_tokens
+        selected_reference_origin = selected_origin
+        selected_reference_end = min(
+            selected_origin + _SEGMENT_DURATION,
+            wav.shape[-1] / _SAMPLE_RATE,
         )
-        recovery_event = RecoveryDiagnosticsEvent(
-            chunk_index=chunk_index,
-            seek_time=ownership_start,
-            trigger_reason=trigger_reason,
-            trigger_token_index=len(chunk_tokens) - len(prompt_ids),
-            base_seed=recovery_seed,
-            derived_seed=seed,
-            attempt=0,
-            execution="sequential",
-            trigger_match=primary_match,
-            candidates=tuple(candidate_diagnostics),
-            selected_candidate=selected_name,
-            selection_reason=selection_reason,
-            selected_model_name=(
-                None
-                if selected_diagnostic is None
-                else selected_diagnostic.model_name
-            ),
-                replay_start_time=(
-                    None
-                    if selected_name in {"fresh_reanchor", "discarded"}
-                    else (
-                        selected_reference_origin
-                        if selected_name == "safe_frontier"
-                        else selected_origin
-                    )
-                ),
-            verification_start_time=(
-                None
-                if selected_name in {"fresh_reanchor", "discarded"}
-                else verification_start
-            ),
-            verification_end_time=(
-                None
-                if selected_name in {"fresh_reanchor", "discarded"}
-                else verification_end
-            ),
-            output_start_time=ownership_start,
-            output_end_time=ownership_end,
-            selected_reference_eligible=(
-                selected_diagnostic is not None
-                and selected_diagnostic.reference_eligible
-            ),
-            safe_frontier_source=safe_frontier_source,
-            safe_frontier_time=safe_frontier_time,
-            overlap_probe=overlap_probe,
+        ownership_end = min(
+            next_seek or audio_duration,
+            selected_reference_end,
         )
-    elif trigger_reason is not None:
-        return _recovery_disabled(stem, config, chunk, primary, outcome)
-
-    # The primary verdict fields ride through untouched: `_resume_primary` already replaced them on `outcome`.
+        selected_tokens = overlap_runtime.canonicalize_tokens(
+            model._tokenizer,
+            selected_tokens,
+            selected_origin,
+            ownership_start,
+            ownership_end,
+        )
+    recovery.selected_origin = selected_origin
+    recovery.ownership_end = ownership_end
     return replace(
         outcome,
         selected_tokens=selected_tokens,
@@ -1765,7 +1593,137 @@ def _recover_chunk(
         accepted_chunk_quality=accepted_chunk_quality,
         ended=ended,
         force_reflow=force_reflow,
-        recovery_event=recovery_event,
+    )
+
+
+def _recovery_event(
+    config: _RecoveryConfig,
+    chunk: _ChunkContext,
+    primary: _PrimaryOutcome,
+    recovery: _Recovery,
+    overlap_probe: OverlapProvenanceProbe | None,
+) -> RecoveryDiagnosticsEvent:
+    """The diagnostics record of a settled recovery. Reporting only: nothing reads it back into a decision."""
+    selected_name = recovery.selected_name
+    frontier = recovery.frontier if selected_name == "safe_frontier" else None
+    selected_diagnostic = next(
+        (
+            candidate
+            for candidate in recovery.candidate_diagnostics
+            if candidate.name == (frontier.source if frontier is not None else selected_name)
+        ),
+        None,
+    )
+    not_replayed = selected_name in {"fresh_reanchor", "discarded"}
+    return RecoveryDiagnosticsEvent(
+        chunk_index=chunk.chunk_index,
+        seek_time=chunk.ownership_start,
+        trigger_reason=primary.trigger_reason,
+        trigger_token_index=len(primary.chunk_tokens) - len(chunk.prompt_ids),
+        base_seed=config.recovery_seed,
+        derived_seed=recovery.seed,
+        attempt=0,
+        execution="sequential",
+        trigger_match=primary.primary_match,
+        candidates=tuple(recovery.candidate_diagnostics),
+        selected_candidate=selected_name,
+        selection_reason=recovery.selection_reason,
+        selected_model_name=(
+            None
+            if selected_diagnostic is None
+            else selected_diagnostic.model_name
+        ),
+        replay_start_time=None if not_replayed else recovery.selected_origin,
+        verification_start_time=None if not_replayed else chunk.verification_start,
+        verification_end_time=None if not_replayed else chunk.verification_end,
+        output_start_time=chunk.ownership_start,
+        output_end_time=recovery.ownership_end,
+        selected_reference_eligible=(
+            selected_diagnostic is not None
+            and selected_diagnostic.reference_eligible
+        ),
+        safe_frontier_source=None if frontier is None else frontier.source,
+        safe_frontier_time=None if frontier is None else frontier.time,
+        overlap_probe=overlap_probe,
+    )
+
+
+def _recover_chunk(
+    stem: _StemContext,
+    config: _RecoveryConfig,
+    chunk: _ChunkContext,
+    primary: _PrimaryOutcome,
+    outcome: _ChunkOutcome,
+) -> Iterator[object]:
+    """Decide what this chunk emits when the primary attempt is not trusted.
+
+    A generator, and the caller delegates with `yield from`: the driver (`region_producer.advance`) pairs every request with exactly one `send()`, and delegation is transcript-identical to the inline branch this grew out of, including the path that yields nothing (`docs/run-evidence/yieldfrom-delegation-probe-260906.py`).
+
+    The stages, in order, each a function above; `_Recovery` carries what they decide. `primary` and `outcome` are values and are REPLACED by `_resume_primary`, so every later stage reads the continuation, never the checkpoint-time primary."""
+    if primary.trigger_reason is None:
+        return outcome
+    if not stem.recovery_enabled:
+        return _recovery_disabled(stem, config, chunk, primary, outcome)
+
+    pair = _candidate_pair(stem, config, chunk)
+    recovery_results = yield RecoveryCandidateGroupRequest(
+        (pair.shifted_request, pair.secondary_request),
+        parent_resident_handle=primary.primary_handle,
+    )
+    recovery = _Recovery(pair, _verify_at_checkpoint(stem, chunk, pair, recovery_results))
+
+    assert primary.primary_diagnostic is not None
+    checkpoint_selection = select_checkpoint_candidate(
+        primary.primary_diagnostic,
+        (
+            recovery.candidate_states["shifted_replay"].diagnostic,
+            recovery.candidate_states[recovery.secondary_name].diagnostic,
+        ),
+    )
+    recovery.checkpoint_selected_name = (
+        checkpoint_selection.name if checkpoint_selection is not None else None
+    )
+    # The checkpoint winner resumes first; the losers' paused KV is kept until every attempt is over (`_discard_losers`), so a winner whose CONTINUATION fails terminally
+    # can be replaced by the next checkpoint-eligible candidate instead of ending as a frontier prefix or a discarded chunk. Owner-directed 2026-08-29; measured pool: 57 discarded + 23 frontier of 2053 decisions.
+    if (
+        stem.recovery_selection == "checkpoint"
+        and recovery.checkpoint_selected_name == "primary"
+        and primary.primary_handle is not None
+    ):
+        primary, outcome = yield from _resume_primary(stem, chunk, primary, outcome)
+    yield from _attempt_candidates(stem, chunk, primary, recovery)
+    yield from _discard_losers(stem, primary, recovery)
+    _select_candidate(stem, primary, recovery)
+
+    if recovery.selected_name is None:
+        recovery.frontier = _safe_frontier(stem, chunk, primary, recovery)
+        if recovery.frontier is not None:
+            recovery.selected_name = "safe_frontier"
+            recovery.selection_reason = "safe_frontier_prefix_retained"
+    # Disabling fresh re-anchor makes this chunk a discard instead.
+    if recovery.selected_name is None and config.fresh_reanchor:
+        recovery.fresh = yield from _fresh_reanchor(stem, config, chunk)
+        recovery.candidate_diagnostics.append(recovery.fresh.diagnostic)
+        if recovery.fresh.eligible:
+            recovery.selected_name = "fresh_reanchor"
+            recovery.selection_reason = "fresh_reanchor_reference_eligible"
+    if recovery.selected_name is None:
+        recovery.selected_name = "discarded"
+        recovery.selection_reason = (
+            "fresh_reanchor_rejected_chunk_discarded"
+            if config.fresh_reanchor
+            else "fresh_reanchor_disabled_chunk_discarded"
+        )
+
+    outcome = _settle(stem, chunk, primary, outcome, recovery)
+    overlap_probe = (
+        _overlap_probe(stem, chunk, primary, recovery)
+        if config.overlap_probe_enabled
+        else None
+    )
+    return replace(
+        outcome,
+        recovery_event=_recovery_event(config, chunk, primary, recovery, overlap_probe),
     )
 
 
