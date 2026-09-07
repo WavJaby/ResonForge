@@ -559,6 +559,179 @@ def _fresh_reanchor(
     return _FreshReanchor(fresh_tokens, fresh_ended, fresh_quality, fresh_diagnostic)
 
 
+@dataclass(frozen=True)
+class _CandidatePair:
+    """The A/B pair every recovery issues together: a shifted replay of the primary model and the secondary candidate.
+
+    Both requests are built before either runs, so 70% of the secondary's output is discarded (`CLAUDE.md`, the `medium` lane) -- reducing that is a change here, not in any model choice."""
+
+    seed: int
+    secondary_name: SecondaryCandidate
+    shifted_seek: float
+    secondary_seek: float
+    shifted_request: RecoveryCandidateSpec
+    secondary_request: RecoveryCandidateSpec
+
+
+def _candidate_pair(
+    stem: _StemContext,
+    config: _RecoveryConfig,
+    chunk: _ChunkContext,
+) -> _CandidatePair:
+    """Build both recovery requests for this chunk. Pure: nothing yielded, nothing mutated."""
+    model = stem.model
+    wav = stem.wav
+    instrument_group = stem.instrument_group
+    max_gen_len = stem.max_gen_len
+    temperature = stem.temperature
+    cfg_coef = stem.cfg_coef
+    forbidden_tokens = stem.forbidden_tokens
+    trace_collector = stem.trace_collector
+    trace_context_prefix = stem.trace_context_prefix
+    eos_id = stem.eos_id
+    recovery_guard = stem.recovery_guard
+    recovery_shift_seconds = config.recovery_shift_seconds
+    recovery_seed = config.recovery_seed
+    secondary_recovery_shifted = config.secondary_recovery_shifted
+    secondary_candidate = config.secondary_candidate
+    chunk_index = chunk.chunk_index
+    condition = chunk.condition
+    seek = chunk.seek
+    previous_tokens = chunk.previous_tokens
+    previous_seek = chunk.previous_seek
+    verification_start = chunk.verification_start
+    verification_end = chunk.verification_end
+    prompt_ids = chunk.prompt_ids
+    prompt_plan = chunk.prompt_plan
+
+    seed = derive_recovery_seed(recovery_seed, chunk_index, 0)
+    shifted_seek = max(0.0, seek - recovery_shift_seconds)
+    shifted_condition = _condition_at(model, wav, shifted_seek, instrument_group)
+    shifted_open = overlap_runtime.open_keys_at(
+        model._tokenizer,
+        previous_tokens,
+        previous_seek,
+        shifted_seek,
+    )
+    extended_replay = overlap_runtime.note_events_in_range(
+        model._tokenizer,
+        previous_tokens,
+        previous_seek,
+        shifted_seek,
+        verification_start,
+    )
+    shifted_prompt_plan = overlap_runtime.plan_prompt(
+        model._tokenizer,
+        shifted_open,
+        extended_replay,
+        shifted_seek,
+        max_gen_len,
+    )
+    shifted_prompt_ids = list(shifted_prompt_plan.prompt_ids)
+    secondary_condition = (
+        shifted_condition if secondary_recovery_shifted else condition
+    )
+    secondary_name = secondary_candidate
+    secondary_sampling = secondary_name == "new_seed"
+    secondary_seek = shifted_seek if secondary_recovery_shifted else seek
+    secondary_prompt_ids = (
+        shifted_prompt_ids if secondary_recovery_shifted else prompt_ids
+    )
+    secondary_prompt_bucket = (
+        shifted_prompt_plan.padded_tokens
+        if secondary_recovery_shifted
+        else prompt_plan.padded_tokens
+    )
+    vocab = tuple(model._tokenizer._vocab)
+    forbidden_ids = (
+        tuple(int(token) for token in forbidden_tokens.tolist())
+        if forbidden_tokens is not None
+        else ()
+    )
+    secondary_checkpoint = checkpoint_shift_tokens(
+        vocab,
+        round(
+            (verification_end - secondary_seek)
+            * model._tokenizer.frame_rate
+        ),
+    )
+    secondary_request = RecoveryCandidateSpec(
+        candidate_name=secondary_name,
+        request=GenerationRequest(
+            condition=secondary_condition,
+            prompt_ids=tuple(secondary_prompt_ids),
+            forbidden_token_ids=forbidden_ids,
+            max_gen_len=max_gen_len,
+            use_sampling=secondary_sampling,
+            temperature=temperature,
+            cfg_coef=cfg_coef,
+            eos_id=eos_id,
+            prompt_bucket=secondary_prompt_bucket,
+            sampling_seed=seed if secondary_sampling else None,
+            trace_collector=trace_collector,
+            trace_context=(
+                *trace_context_prefix, secondary_name, chunk_index
+            ),
+            checkpoint_token_ids=secondary_checkpoint,
+            **row_guard_fields(recovery_guard, vocab),
+            temporal_grammar=TemporalGrammarConfig.from_vocab(
+                vocab, tuple(secondary_prompt_ids), secondary_checkpoint
+            ),
+        ),
+        expected_frame_rate=model._tokenizer.frame_rate,
+        expected_vocab=vocab,
+        target_model=(
+            getattr(model, "_model_name", None)
+            if secondary_sampling
+            else None
+        ),
+        model_role="primary" if secondary_sampling else "recovery",
+    )
+    shifted_checkpoint = checkpoint_shift_tokens(
+        vocab,
+        round(
+            (verification_end - shifted_seek)
+            * model._tokenizer.frame_rate
+        ),
+    )
+    shifted_request = RecoveryCandidateSpec(
+        candidate_name="shifted_replay",
+        request=GenerationRequest(
+            condition=shifted_condition,
+            prompt_ids=tuple(shifted_prompt_ids),
+            forbidden_token_ids=forbidden_ids,
+            max_gen_len=max_gen_len,
+            use_sampling=True,
+            temperature=temperature,
+            cfg_coef=cfg_coef,
+            eos_id=eos_id,
+            prompt_bucket=shifted_prompt_plan.padded_tokens,
+            sampling_seed=seed,
+            trace_collector=trace_collector,
+            trace_context=(
+                *trace_context_prefix, "shifted_replay", chunk_index
+            ),
+            checkpoint_token_ids=shifted_checkpoint,
+            **row_guard_fields(recovery_guard, vocab),
+            temporal_grammar=TemporalGrammarConfig.from_vocab(
+                vocab, tuple(shifted_prompt_ids), shifted_checkpoint
+            ),
+        ),
+        expected_frame_rate=model._tokenizer.frame_rate,
+        expected_vocab=vocab,
+        target_model=getattr(model, "_model_name", None),
+        model_role="primary",
+    )
+    return _CandidatePair(
+        seed=seed,
+        secondary_name=secondary_name,
+        shifted_seek=shifted_seek,
+        secondary_seek=secondary_seek,
+        shifted_request=shifted_request,
+        secondary_request=secondary_request,
+    )
+
+
 def _recover_chunk(
     stem: _StemContext,
     config: _RecoveryConfig,
@@ -580,30 +753,17 @@ def _recover_chunk(
     being rewritten -- one variable, not two."""
     model = stem.model
     wav = stem.wav
-    instrument_group = stem.instrument_group
-    max_gen_len = stem.max_gen_len
     use_sampling = stem.use_sampling
-    temperature = stem.temperature
-    cfg_coef = stem.cfg_coef
-    forbidden_tokens = stem.forbidden_tokens
     recovery_selection = stem.recovery_selection
-    trace_collector = stem.trace_collector
-    trace_context_prefix = stem.trace_context_prefix
     chunk_quality_history = stem.chunk_quality_history
     recovery_enabled = stem.recovery_enabled
-    eos_id = stem.eos_id
     audio_duration = stem.audio_duration
     primary_quality_guard = stem.primary_quality_guard
-    recovery_guard = stem.recovery_guard
     recovery_quality_guard = stem.recovery_quality_guard
-    recovery_shift_seconds = config.recovery_shift_seconds
     recovery_seed = config.recovery_seed
-    secondary_recovery_shifted = config.secondary_recovery_shifted
-    secondary_candidate = config.secondary_candidate
     fresh_reanchor = config.fresh_reanchor
     overlap_probe_enabled = config.overlap_probe_enabled
     chunk_index = chunk.chunk_index
-    condition = chunk.condition
     ownership_start = chunk.ownership_start
     seek = chunk.seek
     next_seek = chunk.next_seek
@@ -613,7 +773,6 @@ def _recover_chunk(
     verification_end = chunk.verification_end
     verification_end_shift = chunk.verification_end_shift
     prompt_ids = chunk.prompt_ids
-    prompt_plan = chunk.prompt_plan
     primary_generation = primary.primary_generation
     primary_handle = primary.primary_handle
     primary_diagnostic = primary.primary_diagnostic
@@ -643,124 +802,13 @@ def _recover_chunk(
 
     recovery_event: RecoveryDiagnosticsEvent | None = None
     if recovery_enabled and trigger_reason is not None:
-        seed = derive_recovery_seed(recovery_seed, chunk_index, 0)
-        shifted_seek = max(0.0, seek - recovery_shift_seconds)
-        shifted_condition = _condition_at(model, wav, shifted_seek, instrument_group)
-        shifted_open = overlap_runtime.open_keys_at(
-            model._tokenizer,
-            previous_tokens,
-            previous_seek,
-            shifted_seek,
-        )
-        extended_replay = overlap_runtime.note_events_in_range(
-            model._tokenizer,
-            previous_tokens,
-            previous_seek,
-            shifted_seek,
-            verification_start,
-        )
-        shifted_prompt_plan = overlap_runtime.plan_prompt(
-            model._tokenizer,
-            shifted_open,
-            extended_replay,
-            shifted_seek,
-            max_gen_len,
-        )
-        shifted_prompt_ids = list(shifted_prompt_plan.prompt_ids)
-        secondary_condition = (
-            shifted_condition if secondary_recovery_shifted else condition
-        )
-        secondary_name = secondary_candidate
-        secondary_sampling = secondary_name == "new_seed"
-        secondary_seek = shifted_seek if secondary_recovery_shifted else seek
-        secondary_prompt_ids = (
-            shifted_prompt_ids if secondary_recovery_shifted else prompt_ids
-        )
-        secondary_prompt_bucket = (
-            shifted_prompt_plan.padded_tokens
-            if secondary_recovery_shifted
-            else prompt_plan.padded_tokens
-        )
-        vocab = tuple(model._tokenizer._vocab)
-        forbidden_ids = (
-            tuple(int(token) for token in forbidden_tokens.tolist())
-            if forbidden_tokens is not None
-            else ()
-        )
-        secondary_checkpoint = checkpoint_shift_tokens(
-            vocab,
-            round(
-                (verification_end - secondary_seek)
-                * model._tokenizer.frame_rate
-            ),
-        )
-        secondary_request = RecoveryCandidateSpec(
-            candidate_name=secondary_name,
-            request=GenerationRequest(
-                condition=secondary_condition,
-                prompt_ids=tuple(secondary_prompt_ids),
-                forbidden_token_ids=forbidden_ids,
-                max_gen_len=max_gen_len,
-                use_sampling=secondary_sampling,
-                temperature=temperature,
-                cfg_coef=cfg_coef,
-                eos_id=eos_id,
-                prompt_bucket=secondary_prompt_bucket,
-                sampling_seed=seed if secondary_sampling else None,
-                trace_collector=trace_collector,
-                trace_context=(
-                    *trace_context_prefix, secondary_name, chunk_index
-                ),
-                checkpoint_token_ids=secondary_checkpoint,
-                **row_guard_fields(recovery_guard, vocab),
-                temporal_grammar=TemporalGrammarConfig.from_vocab(
-                    vocab, tuple(secondary_prompt_ids), secondary_checkpoint
-                ),
-            ),
-            expected_frame_rate=model._tokenizer.frame_rate,
-            expected_vocab=vocab,
-            target_model=(
-                getattr(model, "_model_name", None)
-                if secondary_sampling
-                else None
-            ),
-            model_role="primary" if secondary_sampling else "recovery",
-        )
-        shifted_checkpoint = checkpoint_shift_tokens(
-            vocab,
-            round(
-                (verification_end - shifted_seek)
-                * model._tokenizer.frame_rate
-            ),
-        )
-        shifted_request = RecoveryCandidateSpec(
-            candidate_name="shifted_replay",
-            request=GenerationRequest(
-                condition=shifted_condition,
-                prompt_ids=tuple(shifted_prompt_ids),
-                forbidden_token_ids=forbidden_ids,
-                max_gen_len=max_gen_len,
-                use_sampling=True,
-                temperature=temperature,
-                cfg_coef=cfg_coef,
-                eos_id=eos_id,
-                prompt_bucket=shifted_prompt_plan.padded_tokens,
-                sampling_seed=seed,
-                trace_collector=trace_collector,
-                trace_context=(
-                    *trace_context_prefix, "shifted_replay", chunk_index
-                ),
-                checkpoint_token_ids=shifted_checkpoint,
-                **row_guard_fields(recovery_guard, vocab),
-                temporal_grammar=TemporalGrammarConfig.from_vocab(
-                    vocab, tuple(shifted_prompt_ids), shifted_checkpoint
-                ),
-            ),
-            expected_frame_rate=model._tokenizer.frame_rate,
-            expected_vocab=vocab,
-            target_model=getattr(model, "_model_name", None),
-            model_role="primary",
-        )
+        pair = _candidate_pair(stem, config, chunk)
+        seed = pair.seed
+        secondary_name = pair.secondary_name
+        shifted_seek = pair.shifted_seek
+        secondary_seek = pair.secondary_seek
+        shifted_request = pair.shifted_request
+        secondary_request = pair.secondary_request
 
         recovery_results = yield RecoveryCandidateGroupRequest(
             (shifted_request, secondary_request),
