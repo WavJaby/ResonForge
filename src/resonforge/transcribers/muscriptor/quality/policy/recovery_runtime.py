@@ -932,6 +932,186 @@ def _safe_frontier(
     return None
 
 
+def _resume_primary(
+    stem: _StemContext,
+    chunk: _ChunkContext,
+    primary: _PrimaryOutcome,
+    outcome: _ChunkOutcome,
+) -> Iterator[object]:
+    """Resume the primary row paused at its checkpoint and re-evaluate it as a completed chunk.
+
+    Returns the replaced `(primary, outcome)` pair: the continuation rewrites the tokens, the handle, the guard verdict and the diagnostic, and nothing downstream may read the checkpoint-time values again."""
+    model = stem.model
+    use_sampling = stem.use_sampling
+    chunk_quality_history = stem.chunk_quality_history
+    primary_quality_guard = stem.primary_quality_guard
+    ownership_start = chunk.ownership_start
+    seek = chunk.seek
+    prompt_ids = chunk.prompt_ids
+    primary_handle = primary.primary_handle
+    primary_match = primary.primary_match
+    primary_guard_findings = primary.primary_guard_findings
+    primary_quality_end = primary.primary_quality_end
+    chunk_quality_reference_samples = primary.chunk_quality_reference_samples
+    primary_summary = outcome.primary_summary
+
+    continuation = yield from _resume_resident_generation(
+        primary_handle
+    )
+    chunk_tokens = list(continuation.tokens)
+    ended = continuation.emitted_eos
+    primary_handle = continuation.resident_handle
+    primary_summary = continuation.guard_summary or primary_summary
+    primary_hard_reason = _critical_guard_reason(
+        continuation.guard_findings
+    )
+    (
+        primary_chunk_quality,
+        primary_chunk_action,
+        primary_chunk_findings,
+        primary_chunk_assessment,
+    ) = _evaluate_chunk_quality(
+        model._tokenizer,
+        chunk_tokens,
+        seek,
+        ownership_start,
+        primary_quality_end,
+        max(0, len(chunk_tokens) - len(prompt_ids)),
+        primary_quality_guard,
+        chunk_quality_history.reference(),
+        primary_summary,
+    )
+    primary_diagnostic = evaluate_candidate(
+        "primary",
+        chunk_tokens,
+        len(prompt_ids),
+        ended,
+        model._tokenizer._vocab,
+        verification_match=primary_match,
+        forced_invalid_reason=primary_hard_reason,
+        model_name=getattr(model, "_model_name", None),
+        sampling=use_sampling,
+        condition_seek_time=seek,
+        chunk_quality=primary_chunk_quality,
+        chunk_guard_reasons=tuple(
+            finding.reason for finding in primary_chunk_findings
+        ),
+        guard_findings=(
+            *primary_guard_findings,
+            *primary_chunk_findings,
+        ),
+        chunk_quality_reference_samples=(
+            chunk_quality_reference_samples
+        ),
+        chunk_quality_assessment=primary_chunk_assessment,
+    )
+    return (
+        replace(
+            primary,
+            primary_handle=primary_handle,
+            primary_diagnostic=primary_diagnostic,
+            chunk_tokens=chunk_tokens,
+            primary_hard_reason=primary_hard_reason,
+        ),
+        replace(
+            outcome,
+            ended=ended,
+            primary_summary=primary_summary,
+            primary_chunk_quality=primary_chunk_quality,
+            primary_chunk_action=primary_chunk_action,
+            primary_chunk_findings=primary_chunk_findings,
+            primary_chunk_assessment=primary_chunk_assessment,
+        ),
+    )
+
+
+def _recovery_disabled(
+    stem: _StemContext,
+    config: _RecoveryConfig,
+    chunk: _ChunkContext,
+    primary: _PrimaryOutcome,
+    outcome: _ChunkOutcome,
+) -> _ChunkOutcome:
+    """A triggered chunk with recovery off: keep the primary if it is legal, otherwise discard the chunk. Closes the primary generation."""
+    model = stem.model
+    audio_duration = stem.audio_duration
+    recovery_seed = config.recovery_seed
+    chunk_index = chunk.chunk_index
+    ownership_start = chunk.ownership_start
+    next_seek = chunk.next_seek
+    verification_start = chunk.verification_start
+    verification_end = chunk.verification_end
+    prompt_ids = chunk.prompt_ids
+    primary_generation = primary.primary_generation
+    primary_diagnostic = primary.primary_diagnostic
+    primary_match = primary.primary_match
+    trigger_reason = primary.trigger_reason
+    chunk_tokens = primary.chunk_tokens
+    selected_tokens = outcome.selected_tokens
+    selected_reference_tokens = outcome.selected_reference_tokens
+    selected_reference_origin = outcome.selected_reference_origin
+    selected_reference_end = outcome.selected_reference_end
+    ended = outcome.ended
+    primary_chunk_quality = outcome.primary_chunk_quality
+
+    assert primary_diagnostic is not None
+    primary_generation.close()
+    if primary_diagnostic.structural_valid:
+        accepted_chunk_quality = primary_chunk_quality
+        selected_name = "primary"
+        selection_reason = "primary_legal_recovery_disabled"
+    else:
+        selected_tokens = model._tokenizer.tie_section_token_ids([])
+        selected_reference_tokens = selected_tokens
+        selected_reference_origin = ownership_start
+        selected_reference_end = min(
+            ownership_start + _SEGMENT_DURATION,
+            audio_duration,
+        )
+        ended = True
+        accepted_chunk_quality = None
+        selected_name = "discarded"
+        selection_reason = "recovery_disabled_hard_invalid_discarded"
+    recovery_event = RecoveryDiagnosticsEvent(
+        chunk_index=chunk_index,
+        seek_time=ownership_start,
+        trigger_reason=trigger_reason,
+        trigger_token_index=len(chunk_tokens) - len(prompt_ids),
+        base_seed=recovery_seed,
+        derived_seed=derive_recovery_seed(recovery_seed, chunk_index, 0),
+        attempt=0,
+        execution="disabled",
+        trigger_match=primary_match,
+        candidates=(primary_diagnostic,),
+        selected_candidate=selected_name,
+        selection_reason=selection_reason,
+        selected_model_name=primary_diagnostic.model_name,
+        replay_start_time=(
+            primary_diagnostic.condition_seek_time
+            if selected_name == "primary"
+            else None
+        ),
+        verification_start_time=verification_start,
+        verification_end_time=verification_end,
+        output_start_time=ownership_start,
+        output_end_time=min(next_seek or audio_duration, audio_duration),
+        selected_reference_eligible=(
+            selected_name == "primary"
+            and primary_diagnostic.reference_eligible
+        ),
+    )
+    return replace(
+        outcome,
+        selected_tokens=selected_tokens,
+        selected_reference_tokens=selected_reference_tokens,
+        selected_reference_origin=selected_reference_origin,
+        selected_reference_end=selected_reference_end,
+        accepted_chunk_quality=accepted_chunk_quality,
+        ended=ended,
+        recovery_event=recovery_event,
+    )
+
+
 def _recover_chunk(
     stem: _StemContext,
     config: _RecoveryConfig,
@@ -953,12 +1133,10 @@ def _recover_chunk(
     being rewritten -- one variable, not two."""
     model = stem.model
     wav = stem.wav
-    use_sampling = stem.use_sampling
     recovery_selection = stem.recovery_selection
     chunk_quality_history = stem.chunk_quality_history
     recovery_enabled = stem.recovery_enabled
     audio_duration = stem.audio_duration
-    primary_quality_guard = stem.primary_quality_guard
     recovery_quality_guard = stem.recovery_quality_guard
     recovery_seed = config.recovery_seed
     fresh_reanchor = config.fresh_reanchor
@@ -978,11 +1156,7 @@ def _recover_chunk(
     primary_diagnostic = primary.primary_diagnostic
     primary_match = primary.primary_match
     trigger_reason = primary.trigger_reason
-    primary_guard_findings = primary.primary_guard_findings
-    primary_quality_end = primary.primary_quality_end
-    chunk_quality_reference_samples = primary.chunk_quality_reference_samples
     chunk_tokens = primary.chunk_tokens
-    primary_hard_reason = primary.primary_hard_reason
 
     selected_tokens = outcome.selected_tokens
     selected_reference_tokens = outcome.selected_reference_tokens
@@ -1038,56 +1212,16 @@ def _recover_chunk(
             and checkpoint_selected_name == "primary"
             and primary_handle is not None
         ):
-            continuation = yield from _resume_resident_generation(
-                primary_handle
-            )
-            chunk_tokens = list(continuation.tokens)
-            ended = continuation.emitted_eos
-            primary_handle = continuation.resident_handle
-            primary_summary = continuation.guard_summary or primary_summary
-            primary_hard_reason = _critical_guard_reason(
-                continuation.guard_findings
-            )
-            (
-                primary_chunk_quality,
-                primary_chunk_action,
-                primary_chunk_findings,
-                primary_chunk_assessment,
-            ) = _evaluate_chunk_quality(
-                model._tokenizer,
-                chunk_tokens,
-                seek,
-                ownership_start,
-                primary_quality_end,
-                max(0, len(chunk_tokens) - len(prompt_ids)),
-                primary_quality_guard,
-                chunk_quality_history.reference(),
-                primary_summary,
-            )
-            primary_diagnostic = evaluate_candidate(
-                "primary",
-                chunk_tokens,
-                len(prompt_ids),
-                ended,
-                model._tokenizer._vocab,
-                verification_match=primary_match,
-                forced_invalid_reason=primary_hard_reason,
-                model_name=getattr(model, "_model_name", None),
-                sampling=use_sampling,
-                condition_seek_time=seek,
-                chunk_quality=primary_chunk_quality,
-                chunk_guard_reasons=tuple(
-                    finding.reason for finding in primary_chunk_findings
-                ),
-                guard_findings=(
-                    *primary_guard_findings,
-                    *primary_chunk_findings,
-                ),
-                chunk_quality_reference_samples=(
-                    chunk_quality_reference_samples
-                ),
-                chunk_quality_assessment=primary_chunk_assessment,
-            )
+            primary, outcome = yield from _resume_primary(stem, chunk, primary, outcome)
+            chunk_tokens = primary.chunk_tokens
+            primary_handle = primary.primary_handle
+            primary_diagnostic = primary.primary_diagnostic
+            ended = outcome.ended
+            primary_summary = outcome.primary_summary
+            primary_chunk_quality = outcome.primary_chunk_quality
+            primary_chunk_action = outcome.primary_chunk_action
+            primary_chunk_findings = outcome.primary_chunk_findings
+            primary_chunk_assessment = outcome.primary_chunk_assessment
         attempted_names: set[str] = set()
 
         def _fallback_candidates(
@@ -1530,52 +1664,7 @@ def _recover_chunk(
             overlap_probe=overlap_probe,
         )
     elif trigger_reason is not None:
-        assert primary_diagnostic is not None
-        primary_generation.close()
-        if primary_diagnostic.structural_valid:
-            accepted_chunk_quality = primary_chunk_quality
-            selected_name = "primary"
-            selection_reason = "primary_legal_recovery_disabled"
-        else:
-            selected_tokens = model._tokenizer.tie_section_token_ids([])
-            selected_reference_tokens = selected_tokens
-            selected_reference_origin = ownership_start
-            selected_reference_end = min(
-                ownership_start + _SEGMENT_DURATION,
-                audio_duration,
-            )
-            ended = True
-            accepted_chunk_quality = None
-            selected_name = "discarded"
-            selection_reason = "recovery_disabled_hard_invalid_discarded"
-        recovery_event = RecoveryDiagnosticsEvent(
-            chunk_index=chunk_index,
-            seek_time=ownership_start,
-            trigger_reason=trigger_reason,
-            trigger_token_index=len(chunk_tokens) - len(prompt_ids),
-            base_seed=recovery_seed,
-            derived_seed=derive_recovery_seed(recovery_seed, chunk_index, 0),
-            attempt=0,
-            execution="disabled",
-            trigger_match=primary_match,
-            candidates=(primary_diagnostic,),
-            selected_candidate=selected_name,
-            selection_reason=selection_reason,
-            selected_model_name=primary_diagnostic.model_name,
-            replay_start_time=(
-                primary_diagnostic.condition_seek_time
-                if selected_name == "primary"
-                else None
-            ),
-            verification_start_time=verification_start,
-            verification_end_time=verification_end,
-            output_start_time=ownership_start,
-            output_end_time=min(next_seek or audio_duration, audio_duration),
-            selected_reference_eligible=(
-                selected_name == "primary"
-                and primary_diagnostic.reference_eligible
-            ),
-        )
+        return _recovery_disabled(stem, config, chunk, primary, outcome)
 
     return _ChunkOutcome(
         selected_tokens=selected_tokens,
