@@ -497,7 +497,19 @@ def _declare_kv_pool(
             dtype=dtype,
         )
 
-        def blocks_for(transient_bytes: int) -> int:
+        def blocks_for(
+            transient_bytes: int,
+        ) -> tuple[int, device_ledger.DeviceBudget, int]:
+            """Blocks this lane may declare, plus the division it came from.
+
+            The whole `DeviceBudget` rather than the numbers `note_division`
+            happens to want: every reserve it carries was subtracted here
+            exactly once, and re-deriving any of them at the call site is a
+            second arithmetic that can drift from the one that bound. The
+            first attempt at this recording did exactly that for two of them --
+            `reserve_bytes` recomputed, and the headroom read off the module
+            constant rather than off `_headroom`, which `set_reserves` can move.
+            """
             budget = device_ledger.divide(
                 divisible,
                 # Rows this device will hold once this lane opens: what it already holds + the width being declared.
@@ -512,9 +524,27 @@ def _declare_kv_pool(
             spare = device_ledger.lane_bytes(budget, role)
             # Never below one row across every layer: a supply that can't fund the lane's floor is the terminal capacity outcome and belongs to the scheduler's `DeviceCannotHoldOneRow` (model_workers), not a silent narrowing here.
             # That guard exists since 2026-08-29: `_kv_row_capacity` raises when a WHOLE supply funds zero rows (deadlock capture C).
-            return max(per_row, min(wanted, spare // page))
+            return max(per_row, min(wanted, spare // page)), budget, spare
 
-        wanted = blocks_for(pool_budget.transient_bytes_for(priced_rows))
+        wanted, budget, spare_bytes = blocks_for(
+            pool_budget.transient_bytes_for(priced_rows)
+        )
+        # The declaration's INPUTS, recorded beside the output the caller already gauges.
+        # Without these the one moment that fixes a lane's width for the process lifetime says what it chose and nothing about what it chose from,
+        # and R19's central link stays argued: two lanes declaring 479 MiB and 2,289 MiB in the same run cannot have divided one reading, and nothing said which reading either saw.
+        pool_budget.note_division(
+            lane,
+            free_bytes=free_bytes,
+            # What `mapped_pool_bytes(exclude=lane)` gave back, i.e. the other
+            # lanes' already-mapped KV. Kept separate from `free_bytes` because
+            # the two answer different questions: what the card had, and what
+            # this division pretended it had.
+            add_back_bytes=divisible - free_bytes,
+            process_reserve_bytes=budget.process_reserve_bytes,
+            headroom_bytes=budget.headroom_bytes,
+            divisible_bytes=budget.divisible_bytes,
+            spare_bytes=spare_bytes,
+        )
         # **The counterfactual, and it is why the division above is a closure.**
         # Every width decision prices a row count nothing has decoded at, so it
         # is always the bootstrap -- knowing that says nothing about whether the
@@ -523,7 +553,7 @@ def _declare_kv_pool(
         # no device read, no allocation, one extra divide per declaration.
         from_measurements = pool_budget.extrapolated_transient_bytes(priced_rows)
         if from_measurements is not None:
-            pool_budget.note_width_outcome(wanted, blocks_for(from_measurements))
+            pool_budget.note_width_outcome(wanted, blocks_for(from_measurements)[0])
     pool = declare_pool(
         num_blocks=wanted,
         num_heads=num_heads,

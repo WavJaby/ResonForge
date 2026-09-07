@@ -228,6 +228,10 @@ class DeviceBlockPool:
         self._width_outcomes = 0
         self._width_outcomes_diverged = 0
         self._width_outcome_worst_blocks = 0
+        # What the LAST binding division for each lane was handed, per lane.
+        # The declaration already records what it decided (`kv_pool_declared_bytes`) and recorded nothing about what it decided from,
+        # which is why R19's central link -- "it read the card while separation held it" -- is argued and not gated. Levels, so gauges: R18.
+        self._division_by_lane: dict[str, dict[str, int]] = {}
         # instantaneous, not high-water: a closed lane holds no rows, and reserving for rows nobody has is how the old flat bootstrap held a third of the card against nothing.
         self._resident_rows = 0
         self._transient_measurement_started = False
@@ -384,6 +388,49 @@ class DeviceBlockPool:
                     self._width_outcome_worst_blocks,
                     abs(int(measured_blocks) - int(bootstrap_blocks)),
                 )
+
+    def note_division(
+        self,
+        lane: str,
+        *,
+        free_bytes: int,
+        add_back_bytes: int,
+        process_reserve_bytes: int,
+        headroom_bytes: int,
+        divisible_bytes: int,
+        spare_bytes: int,
+    ) -> None:
+        """Record the inputs of the division that just bound this lane's supply.
+
+        Only the BINDING one. `_declare_kv_pool` divides twice -- once at the
+        price it will charge and once against what the measurements imply
+        (`note_width_outcome`'s counterfactual) -- and recording the second
+        would put a number nothing acted on next to a number something did.
+
+        Last-write-wins per lane rather than a history: a lane declares a
+        handful of times a run and the question is what the *surviving* width
+        was decided from, since width never narrows afterwards.
+        """
+        with self._lock:
+            self._division_by_lane[str(lane)] = {
+                "free_bytes": int(free_bytes),
+                "add_back_bytes": int(add_back_bytes),
+                "process_reserve_bytes": int(process_reserve_bytes),
+                "headroom_bytes": int(headroom_bytes),
+                "divisible_bytes": int(divisible_bytes),
+                "spare_bytes": int(spare_bytes),
+            }
+
+    def division_report(self, lane: str) -> dict[str, int] | None:
+        """What the last binding division for `lane` was handed, or None.
+
+        None means no declaration has happened on this lane yet -- distinct
+        from a division that happened and saw zero, which is what the
+        histograms this replaces could not say apart.
+        """
+        with self._lock:
+            recorded = self._division_by_lane.get(str(lane))
+            return dict(recorded) if recorded is not None else None
 
     def bootstrap_pricing_report(self) -> dict[str, object]:
         """Whether the bootstrap ever bound a width, and whether that cost anything.

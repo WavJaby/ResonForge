@@ -4609,6 +4609,15 @@ class ModelWorkerPool(Generic[_ModelT]):
             declare(model, wanted, run.capacity, run.key.model, role, run.key.device)
         )
         run.observe_lane_gauge("kv_pool_declared_bytes", declared_bytes)
+        # And what that declaration was decided FROM. Recorded here rather than
+        # inside the declaration because the pool is the one thing both sides
+        # already hold; the callable's signature stays `-> int` (R19 step 0).
+        # Gauges, not the counter bag: every one is a level, and a level summed
+        # across an arm's jobs is R18.
+        division = self._pool(run.key.device).division_report(run.key.model)
+        if division is not None:
+            for name, value in division.items():
+                run.observe_lane_gauge(f"kv_pool_division_{name}", value)
         row_bytes = _kv_lane_row_bytes(run.key.device, run.key.model)
         if row_bytes < 1:
             return None
