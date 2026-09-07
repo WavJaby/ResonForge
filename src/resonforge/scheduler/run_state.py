@@ -306,7 +306,7 @@ class _PersistentRun(Generic[_ModelT]):
         self,
         session: _ResumableSession,
     ) -> None:
-        """Accumulate completed CUDA Event timings for this self's record.
+        """Accumulate completed CUDA Event timings for this run's record.
 
         Reporting only. The learned phase-cost curve these used to feed was
         deleted with the rest of the prediction surface; the timings remain
@@ -327,11 +327,15 @@ class _PersistentRun(Generic[_ModelT]):
     def owner_free(self) -> bool:
         """A resident lane holding nothing -- the only state a resize is legal in.
 
-        Same question as `run_owner_free`, read straight off the run: assembling a `SchedulerRunState` costs a device query per self per turn, and this is asked of every self every turn.
-        The two must not disagree, so here is why the shorter list is the SAME list -- five of the assembled fields are implied, and none of them is dropped by choice:
-          active <= occupied; control_intents is built from `pending_controls`;
-          producer_waits and bundle_owned_handles are both proven subsets of `resident_handles_by_key` by invariants asserted where the snapshot is built.
-        `tracked` is implied by nothing, was missing, and is the one field this predicate used to be looser by.
+        Same question as `run_owner_free`, read straight off the run: assembling a `SchedulerRunState` costs a device query per run per turn, and this is asked of every run every turn.
+        The two must not disagree, so here is why the shorter list is the SAME list -- four of the assembled fields are implied, and none of them is dropped by choice:
+          control_intents is built from `pending_controls`;
+          producer_waits and bundle_owned_handles are both proven subsets of `resident_handles_by_key` by invariants asserted where the snapshot is built;
+          `active` beyond `occupied` can only be a PREEMPTED row -- `preempt` sets `slot.row = None`, so it leaves `occupied_count` and stays in `active_count` -- and a preempted row keeps its `active_by_item` entry, which this predicate checks, until it completes or checkpoints.
+        ! the fifth used to be stated as `active <= occupied`. That is FALSE, by the two counts' own definitions, and the reason above is the true one.
+        ! one implication is NOT proven anywhere: `prefill` counts the ROWS inside `prefill_pending` and this counts the BATCHES, so an empty batch would make the two disagree. Neither construction site builds one and nothing asserts it. Found by the gate below, which drives the realistic case.
+        `tracked` is `len(active_by_item)`, implied by nothing, was missing, and is the one field this predicate used to be looser by.
+        Gated: `test_the_two_owner_free_predicates_answer_the_same_question`.
         """
         session = self.session
         return session is not None and not (
@@ -344,6 +348,15 @@ class _PersistentRun(Generic[_ModelT]):
         )
 
     def releasable(self) -> bool:
+        """Whether `session.close()` would accept this lane.
+
+        NOT a stricter twin of `owner_free` -- a different question. Its extra
+        terms mirror `ContinuousGenerationBatch.close`'s own precondition
+        (`active_count or occupied_count or displaced_count` raises), term for
+        term, so that when that guard changes there is one place to look.
+        `owner_free`'s callers -- resize and the reclaim donor check -- do not
+        close the session and do not owe those terms.
+        """
         session = self.session
         return session is not None and not any(
             (
@@ -397,7 +410,7 @@ class _PersistentRun(Generic[_ModelT]):
         name: str,
         value: int,
     ) -> None:
-        """A LEVEL that belongs to the device, recorded against one self of it.
+        """A LEVEL that belongs to the device, recorded against one run of it.
 
         Unkeyed: every lane on the device would report the same reading, and
         `max` is the aggregation that survives two of them doing so.
@@ -428,7 +441,7 @@ class _PersistentRun(Generic[_ModelT]):
 
     def arena_bytes(self,
         width: int | None = None) -> int:
-        """What this self's arena occupies, at the width it will actually open.
+        """What this run's arena occupies, at the width it will actually open.
 
         `measured_row_bytes` is what a live session reported for this self's own
         rows; it beats the analytic price whenever it is larger, because the
@@ -459,7 +472,7 @@ class _PersistentRun(Generic[_ModelT]):
         self,
         stats: object,
     ) -> None:
-        """Fold one consumed quantum's session stats into the self's telemetry."""
+        """Fold one consumed quantum's session stats into the run's telemetry."""
         self.quantum_count += 1
         self.stats.physical_steps += int(getattr(stats, "physical_steps", 0))
         self.stats.wasted_token_rows += int(getattr(stats, "wasted_token_rows", 0))
@@ -469,10 +482,10 @@ class _PersistentRun(Generic[_ModelT]):
             ) + int(steps)
 
     def collect_preemption_telemetry(self) -> None:
-        """Move what preemption cost this self's session into its observations.
+        """Move what preemption cost this run's session into its observations.
 
-        Called once per quantum and once more wherever the session is about to be let go, so nothing is attributed to a self that didn't incur it and nothing is dropped because the last quantum was the one that preempted.
-        Not bracketed around a single action on purpose: the admission path preempts too, and bracketing decode alone is what reported a self's 66 preemptions as none.
+        Called once per quantum and once more wherever the session is about to be let go, so nothing is attributed to a run that didn't incur it and nothing is dropped because the last quantum was the one that preempted.
+        Not bracketed around a single action on purpose: the admission path preempts too, and bracketing decode alone is what reported a run's 66 preemptions as none.
         """
         drain = getattr(self.session, "drain_preemption_telemetry", None)
         if not callable(drain):
