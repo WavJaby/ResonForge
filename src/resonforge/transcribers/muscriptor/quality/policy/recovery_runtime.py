@@ -398,6 +398,167 @@ class _ChunkOutcome:
     recovery_event: RecoveryDiagnosticsEvent | None
 
 
+@dataclass(frozen=True)
+class _FreshReanchor:
+    """What the last-resort candidate produced. `quality` is None unless the chunk was structurally valid."""
+
+    tokens: list[int]
+    ended: bool
+    quality: ChunkQualityMetrics | None
+    diagnostic: RecoveryCandidateDiagnostics
+
+    @property
+    def eligible(self) -> bool:
+        return self.diagnostic.structural_valid and self.diagnostic.reference_eligible
+
+
+def _fresh_reanchor(
+    stem: _StemContext,
+    config: _RecoveryConfig,
+    chunk: _ChunkContext,
+) -> Iterator[object]:
+    """Generate the chunk from nothing on the fresh model and evaluate it.
+
+    The last-resort candidate: primary, both A/B candidates and the safe frontier all failed. It is the only generation on this path with no prompt, so it costs a full chunk on the larger model.
+    One request yielded, plus a discard if the executor published a handle it never should have."""
+    model = stem.model
+    max_gen_len = stem.max_gen_len
+    temperature = stem.temperature
+    cfg_coef = stem.cfg_coef
+    forbidden_tokens = stem.forbidden_tokens
+    trace_collector = stem.trace_collector
+    trace_context_prefix = stem.trace_context_prefix
+    chunk_quality_history = stem.chunk_quality_history
+    eos_id = stem.eos_id
+    audio_duration = stem.audio_duration
+    recovery_quality_guard = stem.recovery_quality_guard
+    fresh_guard = stem.fresh_guard
+    fresh_reanchor_model = config.fresh_reanchor_model
+    chunk_index = chunk.chunk_index
+    condition = chunk.condition
+    ownership_start = chunk.ownership_start
+    next_seek = chunk.next_seek
+
+    fresh_quality: ChunkQualityMetrics | None = None
+    fresh_vocab = tuple(model._tokenizer._vocab)
+    fresh_request = RecoveryCandidateSpec(
+        candidate_name="fresh_reanchor",
+        request=GenerationRequest(
+            condition=condition,
+            prompt_ids=(),
+            forbidden_token_ids=(
+                tuple(
+                    int(token)
+                    for token in forbidden_tokens.tolist()
+                )
+                if forbidden_tokens is not None
+                else ()
+            ),
+            max_gen_len=max_gen_len,
+            use_sampling=False,
+            temperature=temperature,
+            cfg_coef=cfg_coef,
+            eos_id=eos_id,
+            trace_collector=trace_collector,
+            trace_context=(
+                *trace_context_prefix,
+                "fresh_reanchor",
+                chunk_index,
+            ),
+            # Fresh has no later candidate and never publishes a
+            # resident handle. A live critical finding completes
+            # the row as terminally rejected; final validation
+            # still runs.
+            **row_guard_fields(fresh_guard, fresh_vocab),
+            temporal_grammar=TemporalGrammarConfig.from_vocab(
+                fresh_vocab, (), ()
+            ),
+        ),
+        expected_frame_rate=model._tokenizer.frame_rate,
+        expected_vocab=fresh_vocab,
+        target_model=fresh_reanchor_model,
+        model_role="recovery",
+    )
+    fresh_result = yield fresh_request
+    if not isinstance(fresh_result, RecoveryCandidateResult):
+        raise TypeError(
+            "fresh re-anchor requires a compatible recovery result"
+        )
+    if fresh_result.resident_handle is not None:
+        yield from _discard_resident_generation(
+            fresh_result.resident_handle
+        )
+        fresh_forced_reason = "unexpected_fresh_reanchor_checkpoint"
+    else:
+        fresh_forced_reason = _critical_guard_reason(
+            fresh_result.guard_findings
+        )
+    fresh_tokens = list(fresh_result.tokens)
+    fresh_ended = fresh_result.emitted_eos
+    fresh_diagnostic = evaluate_candidate(
+        "fresh_reanchor",
+        fresh_tokens,
+        0,
+        fresh_ended,
+        model._tokenizer._vocab,
+        verification_match=match_note_events([], []),
+        forced_invalid_reason=fresh_forced_reason,
+        model_name=fresh_result.model_name,
+        sampling=False,
+        condition_seek_time=ownership_start,
+        guard_findings=fresh_result.guard_findings,
+    )
+    if fresh_diagnostic.structural_valid:
+        fresh_quality_end = min(
+            next_seek or audio_duration,
+            ownership_start + _SEGMENT_DURATION,
+            audio_duration,
+        )
+        (
+            fresh_quality,
+            _,
+            fresh_findings,
+            fresh_assessment,
+        ) = _evaluate_chunk_quality(
+            model._tokenizer,
+            fresh_tokens,
+            ownership_start,
+            ownership_start,
+            fresh_quality_end,
+            len(fresh_tokens),
+            recovery_quality_guard,
+            chunk_quality_history.reference(),
+            fresh_result.guard_summary,
+        )
+        fresh_diagnostic = evaluate_candidate(
+            "fresh_reanchor",
+            fresh_tokens,
+            0,
+            fresh_ended,
+            model._tokenizer._vocab,
+            verification_match=match_note_events([], []),
+            forced_invalid_reason=_critical_guard_reason(
+                fresh_findings
+            ),
+            model_name=fresh_result.model_name,
+            sampling=False,
+            condition_seek_time=ownership_start,
+            chunk_quality=fresh_quality,
+            chunk_guard_reasons=tuple(
+                finding.reason for finding in fresh_findings
+            ),
+            guard_findings=(
+                *fresh_result.guard_findings,
+                *fresh_findings,
+            ),
+            chunk_quality_reference_samples=len(
+                chunk_quality_history.reference().samples
+            ),
+            chunk_quality_assessment=fresh_assessment,
+        )
+    return _FreshReanchor(fresh_tokens, fresh_ended, fresh_quality, fresh_diagnostic)
+
+
 def _recover_chunk(
     stem: _StemContext,
     config: _RecoveryConfig,
@@ -435,13 +596,11 @@ def _recover_chunk(
     primary_quality_guard = stem.primary_quality_guard
     recovery_guard = stem.recovery_guard
     recovery_quality_guard = stem.recovery_quality_guard
-    fresh_guard = stem.fresh_guard
     recovery_shift_seconds = config.recovery_shift_seconds
     recovery_seed = config.recovery_seed
     secondary_recovery_shifted = config.secondary_recovery_shifted
     secondary_candidate = config.secondary_candidate
     fresh_reanchor = config.fresh_reanchor
-    fresh_reanchor_model = config.fresh_reanchor_model
     overlap_probe_enabled = config.overlap_probe_enabled
     chunk_index = chunk.chunk_index
     condition = chunk.condition
@@ -1055,135 +1214,12 @@ def _recover_chunk(
                 accepted_chunk_quality = None
                 break
 
-        fresh_tokens: list[int] | None = None
-        fresh_ended = False
-        fresh_quality: ChunkQualityMetrics | None = None
-        # The last-resort candidate: primary, both A/B candidates and the
-        # safe frontier all failed. It is the only generation on this path
-        # with no prompt, so it costs a full chunk on the larger model.
-        # Disabling it makes that chunk a discard instead.
+        fresh: _FreshReanchor | None = None
+        # Disabling fresh re-anchor makes this chunk a discard instead.
         if selected_name is None and fresh_reanchor:
-            fresh_vocab = tuple(model._tokenizer._vocab)
-            fresh_request = RecoveryCandidateSpec(
-                candidate_name="fresh_reanchor",
-                request=GenerationRequest(
-                    condition=condition,
-                    prompt_ids=(),
-                    forbidden_token_ids=(
-                        tuple(
-                            int(token)
-                            for token in forbidden_tokens.tolist()
-                        )
-                        if forbidden_tokens is not None
-                        else ()
-                    ),
-                    max_gen_len=max_gen_len,
-                    use_sampling=False,
-                    temperature=temperature,
-                    cfg_coef=cfg_coef,
-                    eos_id=eos_id,
-                    trace_collector=trace_collector,
-                    trace_context=(
-                        *trace_context_prefix,
-                        "fresh_reanchor",
-                        chunk_index,
-                    ),
-                    # Fresh has no later candidate and never publishes a
-                    # resident handle. A live critical finding completes
-                    # the row as terminally rejected; final validation
-                    # still runs.
-                    **row_guard_fields(fresh_guard, fresh_vocab),
-                    temporal_grammar=TemporalGrammarConfig.from_vocab(
-                        fresh_vocab, (), ()
-                    ),
-                ),
-                expected_frame_rate=model._tokenizer.frame_rate,
-                expected_vocab=fresh_vocab,
-                target_model=fresh_reanchor_model,
-                model_role="recovery",
-            )
-            fresh_result = yield fresh_request
-            if not isinstance(fresh_result, RecoveryCandidateResult):
-                raise TypeError(
-                    "fresh re-anchor requires a compatible recovery result"
-                )
-            if fresh_result.resident_handle is not None:
-                yield from _discard_resident_generation(
-                    fresh_result.resident_handle
-                )
-                fresh_forced_reason = "unexpected_fresh_reanchor_checkpoint"
-            else:
-                fresh_forced_reason = _critical_guard_reason(
-                    fresh_result.guard_findings
-                )
-            fresh_tokens = list(fresh_result.tokens)
-            fresh_ended = fresh_result.emitted_eos
-            fresh_diagnostic = evaluate_candidate(
-                "fresh_reanchor",
-                fresh_tokens,
-                0,
-                fresh_ended,
-                model._tokenizer._vocab,
-                verification_match=match_note_events([], []),
-                forced_invalid_reason=fresh_forced_reason,
-                model_name=fresh_result.model_name,
-                sampling=False,
-                    condition_seek_time=ownership_start,
-                    guard_findings=fresh_result.guard_findings,
-                )
-            if fresh_diagnostic.structural_valid:
-                fresh_quality_end = min(
-                    next_seek or audio_duration,
-                    ownership_start + _SEGMENT_DURATION,
-                    audio_duration,
-                )
-                (
-                    fresh_quality,
-                    _,
-                    fresh_findings,
-                    fresh_assessment,
-                ) = _evaluate_chunk_quality(
-                    model._tokenizer,
-                    fresh_tokens,
-                    ownership_start,
-                    ownership_start,
-                    fresh_quality_end,
-                    len(fresh_tokens),
-                    recovery_quality_guard,
-                    chunk_quality_history.reference(),
-                    fresh_result.guard_summary,
-                )
-                fresh_diagnostic = evaluate_candidate(
-                    "fresh_reanchor",
-                    fresh_tokens,
-                    0,
-                    fresh_ended,
-                    model._tokenizer._vocab,
-                    verification_match=match_note_events([], []),
-                    forced_invalid_reason=_critical_guard_reason(
-                        fresh_findings
-                    ),
-                    model_name=fresh_result.model_name,
-                    sampling=False,
-                    condition_seek_time=ownership_start,
-                    chunk_quality=fresh_quality,
-                    chunk_guard_reasons=tuple(
-                        finding.reason for finding in fresh_findings
-                    ),
-                    guard_findings=(
-                        *fresh_result.guard_findings,
-                        *fresh_findings,
-                    ),
-                    chunk_quality_reference_samples=len(
-                        chunk_quality_history.reference().samples
-                    ),
-                    chunk_quality_assessment=fresh_assessment,
-                )
-            candidate_diagnostics.append(fresh_diagnostic)
-            if (
-                fresh_diagnostic.structural_valid
-                and fresh_diagnostic.reference_eligible
-            ):
+            fresh = yield from _fresh_reanchor(stem, config, chunk)
+            candidate_diagnostics.append(fresh.diagnostic)
+            if fresh.eligible:
                 selected_name = "fresh_reanchor"
                 selection_reason = "fresh_reanchor_reference_eligible"
 
@@ -1203,11 +1239,11 @@ def _recover_chunk(
             selected_origin = seek
             accepted_chunk_quality = primary_chunk_quality
         elif selected_name == "fresh_reanchor":
-            assert fresh_tokens is not None
-            selected_tokens = fresh_tokens
+            assert fresh is not None
+            selected_tokens = fresh.tokens
             selected_origin = ownership_start
-            ended = fresh_ended
-            accepted_chunk_quality = fresh_quality
+            ended = fresh.ended
+            accepted_chunk_quality = fresh.quality
         elif selected_name == "safe_frontier":
             assert selected_reference_tokens is not None
             assert selected_reference_origin is not None
@@ -1295,11 +1331,11 @@ def _recover_chunk(
                 )
                 for name, state in candidate_states.items()
             )
-            if fresh_tokens is not None:
+            if fresh is not None:
                 probe_candidates.append(
                     build_overlap_probe_stream(
                         "fresh_reanchor",
-                        fresh_tokens,
+                        fresh.tokens,
                         model._tokenizer._vocab,
                         origin=ownership_start,
                         frame_rate=model._tokenizer.frame_rate,
