@@ -29,6 +29,7 @@ from resonforge.scheduler.device.block_pool import (
     blocks_for,
     demand_width,
     device_block_pool,
+    device_ceiling,
     reserve_bytes,
     width_that_fits,
 )
@@ -46,6 +47,7 @@ from resonforge.scheduler.liveness.scheduler import (
     SchedulerState,
     enabled_actions,
     external_waits_cover_state,
+    preferred_actions,
     run_owner_free,
     validate_scheduler_state,
 )
@@ -74,6 +76,7 @@ from resonforge.scheduler.run_state import (
     _ResultT,
     _RunTelemetry,
     _WidthBound,
+    prepare_persistent_selection,
     task_decode_budget,
     task_prefill_budget,
     task_purpose,
@@ -89,6 +92,65 @@ _DECLARATION_POLL_SECONDS = 1.0
 # Since A3 preemption frees the same slot -- pages go back to the supply, the row is rebuilt bit-identical by re-running what wrote its KV.
 # Allocates nothing => nothing left to trade.
 
+
+
+def validate_batch_submission(submission: BatchSubmission) -> None:
+    # **0 means no forced ceiling**, which is the ordinary case since the
+    # two width constants were deleted: what bounds a lane is its own
+    # demand and what the device can give it. A positive value is an
+    # operator's `--batch-size`, which the pool refuses rather than narrows.
+    if submission.max_batch_size < 0:
+        raise ValueError("max_batch_size cannot be negative")
+    if submission.batch_dimension is not None and submission.batch_dimension < 0:
+        raise ValueError("batch_dimension cannot be negative")
+    if submission.minimum_width < 1:
+        raise ValueError("minimum width must be positive")
+    if submission.continuous_factory is None and not _is_resident_generation_control(
+        submission.item
+    ):
+        raise ValueError("generation work requires a persistent session factory")
+
+
+def classify_action_failure(error: BaseException) -> str:
+    if isinstance(error, SchedulerInvariantError):
+        return "algorithm-invariant"
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return "external-contract"
+    return "runtime-adapter"
+
+
+def allocator_reserved_bytes(device: torch.device) -> int:
+    return max(
+        int(torch.cuda.memory_allocated(device)),
+        int(torch.cuda.memory_reserved(device)),
+    )
+
+
+def accumulate_seconds(
+    target: dict[str, float],
+    name: str,
+    seconds: float,
+) -> None:
+    target[name] = target.get(name, 0.0) + seconds
+
+
+def recovery_verify_prefix(
+    item: object,
+    tokens: tuple[int, ...],
+) -> tuple[int, bool]:
+    boundary = getattr(item, "verify_shift_value", None)
+    vocab = getattr(item, "expected_vocab", ())
+    if boundary is None or not vocab:
+        return 0, False
+    for index, token in enumerate(tokens):
+        if not 0 <= token < len(vocab):
+            continue
+        event = vocab[token]
+        if getattr(event, "type", None) == "shift" and int(
+            getattr(event, "value", -1)
+        ) >= int(boundary):
+            return index + 1, True
+    return len(tokens), False
 
 @dataclass(frozen=True)
 class SchedulerWatchdogConfig:
@@ -680,7 +742,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         `kv_pool` was added to the submission and dropped by the re-submission, so the KV pool was wired end to end and never declared -- a full pipeline run measured nothing and looked fine.
         No list here to fall out of step.
         """
-        self._validate_batch_submission(submission)
+        validate_batch_submission(submission)
         with self._state_lock:
             self._ensure_submission_open_locked()
             task = self._new_batch_task_locked(
@@ -691,22 +753,6 @@ class ModelWorkerPool(Generic[_ModelT]):
             self._queue.put((task.priority + 0.5, task.sequence, task))
         return task.future
 
-    @staticmethod
-    def _validate_batch_submission(submission: BatchSubmission) -> None:
-        # **0 means no forced ceiling**, which is the ordinary case since the
-        # two width constants were deleted: what bounds a lane is its own
-        # demand and what the device can give it. A positive value is an
-        # operator's `--batch-size`, which the pool refuses rather than narrows.
-        if submission.max_batch_size < 0:
-            raise ValueError("max_batch_size cannot be negative")
-        if submission.batch_dimension is not None and submission.batch_dimension < 0:
-            raise ValueError("batch_dimension cannot be negative")
-        if submission.minimum_width < 1:
-            raise ValueError("minimum width must be positive")
-        if submission.continuous_factory is None and not _is_resident_generation_control(
-            submission.item
-        ):
-            raise ValueError("generation work requires a persistent session factory")
 
     def _ensure_submission_open_locked(self) -> None:
         if self._liveness_error is not None:
@@ -768,7 +814,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         if len(members) < 2:
             raise ValueError("dependency bundle requires multiple members")
         for member in members:
-            self._validate_batch_submission(member)
+            validate_batch_submission(member)
             if member.dependency_claim is not None:
                 raise ValueError("dependency bundle members cannot declare parent claims")
             if not bool(getattr(member.item, "requires_dependency_credit", False)):
@@ -1766,7 +1812,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 try:
                     error = self._terminate_liveness(
                         error,
-                        classification=self._classify_action_failure(error),
+                        classification=classify_action_failure(error),
                     )
                 except BaseException as reporting_failure:  # noqa: BLE001
                     # Belt to `_terminate_liveness`'s braces. Whatever it costs
@@ -1992,13 +2038,6 @@ class ModelWorkerPool(Generic[_ModelT]):
             not in self._rejected_actions
         )
 
-    @staticmethod
-    def _accumulate_seconds(
-        target: dict[str, float],
-        name: str,
-        seconds: float,
-    ) -> None:
-        target[name] = target.get(name, 0.0) + seconds
 
     def _accept_action_result(self, result: ActionResult | None) -> None:
         if result is None:
@@ -2012,18 +2051,18 @@ class ModelWorkerPool(Generic[_ModelT]):
         validation_finished = time.perf_counter()
         run = runs.get(result.action.run_id)
         if run is not None:
-            self._accumulate_seconds(
+            accumulate_seconds(
                 run.stats.scheduler_decision_phase_seconds,
                 "post_snapshot",
                 snapshot_finished - snapshot_started,
             )
             for name, seconds in post_snapshot_phase_seconds.items():
-                self._accumulate_seconds(
+                accumulate_seconds(
                     run.stats.scheduler_decision_phase_seconds,
                     f"post_snapshot_{name}",
                     seconds,
                 )
-            self._accumulate_seconds(
+            accumulate_seconds(
                 run.stats.scheduler_decision_phase_seconds,
                 "post_validation",
                 validation_finished - snapshot_finished,
@@ -2128,13 +2167,6 @@ class ModelWorkerPool(Generic[_ModelT]):
             return "external-contract"
         return "algorithm-invariant"
 
-    @staticmethod
-    def _classify_action_failure(error: BaseException) -> str:
-        if isinstance(error, SchedulerInvariantError):
-            return "algorithm-invariant"
-        if isinstance(error, torch.cuda.OutOfMemoryError):
-            return "external-contract"
-        return "runtime-adapter"
 
     def _terminate_liveness(
         self,
@@ -2566,7 +2598,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         runs_by_id = observation.runs_by_id
         legal_actions = observation.legal_actions
         legality_finished = time.perf_counter()
-        preferred_by_id = self._preferred_actions(legal_actions)
+        preferred_by_id = preferred_actions(legal_actions)
         if not preferred_by_id:
             return
         runnable = [runs_by_id[run_id] for run_id in preferred_by_id]
@@ -2594,28 +2626,28 @@ class ModelWorkerPool(Generic[_ModelT]):
         selected_action = preferred_by_id[selected_id]
         run.collect_preemption_telemetry()
         policy_finished = time.perf_counter()
-        self._accumulate_seconds(
+        accumulate_seconds(
             run.stats.scheduler_decision_phase_seconds,
             "snapshot",
             observation.snapshot_seconds,
         )
         for name, seconds in observation.snapshot_phase_seconds.items():
-            self._accumulate_seconds(
+            accumulate_seconds(
                 run.stats.scheduler_decision_phase_seconds,
                 f"snapshot_{name}",
                 seconds,
             )
-        self._accumulate_seconds(
+        accumulate_seconds(
             run.stats.scheduler_decision_phase_seconds,
             "invariant_validation",
             observation.validation_seconds,
         )
-        self._accumulate_seconds(
+        accumulate_seconds(
             run.stats.scheduler_decision_phase_seconds,
             "legality",
             observation.legality_seconds,
         )
-        self._accumulate_seconds(
+        accumulate_seconds(
             run.stats.scheduler_decision_phase_seconds,
             "policy",
             policy_finished - legality_finished,
@@ -2641,7 +2673,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 candidate.age += 1
         run.age = 0
         telemetry_finished = time.perf_counter()
-        self._accumulate_seconds(
+        accumulate_seconds(
             run.stats.scheduler_decision_phase_seconds,
             "telemetry",
             telemetry_finished - telemetry_started,
@@ -2684,7 +2716,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                         model_started,
                         model_finished,
                     )
-                self._accumulate_seconds(
+                accumulate_seconds(
                     run.stats.scheduler_decision_phase_seconds,
                     "model_activation",
                     model_finished - model_started,
@@ -2705,7 +2737,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                     model_finished,
                 )
             operation_started = model_finished
-            self._accumulate_seconds(
+            accumulate_seconds(
                 run.stats.scheduler_decision_phase_seconds,
                 "model_activation",
                 model_elapsed,
@@ -3088,7 +3120,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 if isinstance(error, SchedulerLivenessError)
                 else self._terminate_liveness(
                     error,
-                    classification=self._classify_action_failure(error),
+                    classification=classify_action_failure(error),
                 )
             )
             return ActionResult(
@@ -3099,7 +3131,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             )
         finally:
             if action_adapter_started is not None:
-                self._accumulate_seconds(
+                accumulate_seconds(
                     run.stats.scheduler_action_wall_seconds,
                     action,
                     time.perf_counter() - action_adapter_started,
@@ -3985,9 +4017,6 @@ class ModelWorkerPool(Generic[_ModelT]):
         """
         return {"own_floor_blocks": self._run_floor_blocks(run)}
 
-    @staticmethod
-    def _run_session_owner_free(state: SchedulerRunState) -> bool:
-        return run_owner_free(state)
 
 
     def _run_affordable_bound(
@@ -4006,16 +4035,9 @@ class ModelWorkerPool(Generic[_ModelT]):
         available = view.available_blocks(**self._own_credits(run)) + run.arena_blocks
         # `width_ceiling` is a forced `--batch-size` or nothing. Nothing forced => the byte arithmetic is its own ceiling and the `min` inside `width_that_fits` can't bind.
         # A lane is bounded by its demand and by the device, by no third number.
-        ceiling = run.width_ceiling or self._device_ceiling(cost, available)
+        ceiling = run.width_ceiling or device_ceiling(cost, available)
         return self._width_bound(run, cost, available, ceiling=ceiling)
 
-    @staticmethod
-    def _device_ceiling(cost: ArenaCost, available_blocks: int) -> int:
-        """The widest the free blocks could cover, used where no ceiling exists."""
-        return max(
-            cost.minimum_width,
-            max(0, available_blocks) * BLOCK_BYTES // max(1, cost.row_bytes),
-        )
 
     def _run_affordable_width(
         self,
@@ -4164,7 +4186,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 for run_id, donor in runs.items()
                 if run_id != target_id
                 and donor.key.device == target.key.device
-                and self._run_session_owner_free(states_by_id[run_id])
+                and run_owner_free(states_by_id[run_id])
             )
             if not donor_ids:
                 continue
@@ -4675,47 +4697,6 @@ class ModelWorkerPool(Generic[_ModelT]):
         return True
 
 
-    @staticmethod
-    def _preferred_actions(
-        actions: tuple[SchedulerAction, ...],
-    ) -> dict[int, SchedulerAction]:
-        """Apply run-local policy only after pure legality is established."""
-        order = {
-            SchedulerActionKind.CANCEL: 0,
-            SchedulerActionKind.DISCARD: 1,
-            SchedulerActionKind.CAPACITY_PREPARE: 2,
-            # Beside capacity preparation, same reason: both settle how many rows this lane holds before anything is admitted into them.
-            # Above admission deliberately -- a lane that admits first never reaches the empty slot set a resize needs, so below `condition_prefill` growth is unreachable for any lane that has work.
-            SchedulerActionKind.RESIZE: 2,
-            SchedulerActionKind.RELEASE_ADMIT: 2,
-            SchedulerActionKind.BUNDLE_ADMIT: 2,
-            SchedulerActionKind.PREFILL: 2,
-            SchedulerActionKind.RESTORE: 3,
-            SchedulerActionKind.PREEMPT_RESTORE: 4,
-            SchedulerActionKind.PREEMPT_CONDITION: 5,
-            SchedulerActionKind.CONDITION_BATCH: 7,
-            SchedulerActionKind.CONDITION_PREFILL: 8,
-            SchedulerActionKind.ADMIT: 9,
-            SchedulerActionKind.DECODE: 10,
-            SchedulerActionKind.FAIL: 11,
-        }
-        global_condition = {
-            participant: action
-            for action in actions
-            if action.kind is SchedulerActionKind.CONDITION_BATCH
-            for participant in action.participants
-        }
-        selected: dict[int, SchedulerAction] = {}
-        for action in actions:
-            if (
-                action.kind is SchedulerActionKind.CONDITION_PREFILL
-                and action.run_id in global_condition
-            ):
-                continue
-            current = selected.get(action.run_id)
-            if current is None or order[action.kind] < order[current.kind]:
-                selected[action.run_id] = action
-        return selected
 
     def _preferred_run_action(self, run: _PersistentRun[_ModelT]) -> str:
         state = SchedulerState(
@@ -4723,7 +4704,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             progress_epoch=0,
             runs=(self._scheduler_run_state(run, run_id=0),),
         )
-        selected = self._preferred_actions(enabled_actions(state)).get(0)
+        selected = preferred_actions(enabled_actions(state)).get(0)
         if selected is None:
             raise RuntimeError("persistent run has no enabled action")
         return selected.kind.value
@@ -5060,46 +5041,6 @@ class ModelWorkerPool(Generic[_ModelT]):
         target.scheduler_observations["release_admit_actions"] += 1
         return loaded, model_started, model_finished
 
-    @staticmethod
-    def _prepare_persistent_selection(
-        model: _ModelT,
-        selected: list[tuple[_BatchTask[_ModelT, Any], _PersistentRun[_ModelT] | None]],
-    ) -> tuple[PreparedWorkItem, ...]:
-        """Prepare heterogeneous row roles while preserving admission order."""
-        prepared: list[PreparedWorkItem | None] = [None] * len(selected)
-        groups: list[
-            tuple[
-                Callable[
-                    [_ModelT, tuple[object, ...]], tuple[PreparedWorkItem, ...]
-                ],
-                list[tuple[int, object]],
-            ]
-        ] = []
-        for index, (task, _borrowed_from) in enumerate(selected):
-            if task.prepare is None:
-                prepared[index] = PreparedWorkItem(task.item)
-                continue
-            group = next(
-                (entries for strategy, entries in groups if strategy is task.prepare),
-                None,
-            )
-            if group is None:
-                group = []
-                groups.append((task.prepare, group))
-            group.append((index, task.item))
-
-        for strategy, entries in groups:
-            batch = strategy(model, tuple(item for _index, item in entries))
-            if len(batch) != len(entries):
-                raise RuntimeError("persistent preparation returned the wrong row count")
-            if any(not isinstance(item, PreparedWorkItem) for item in batch):
-                raise TypeError("persistent preparation returned an untyped row")
-            for (index, _item), prepared_item in zip(entries, batch, strict=True):
-                prepared[index] = prepared_item
-
-        if any(item is None for item in prepared):
-            raise RuntimeError("persistent preparation left an unresolved row")
-        return tuple(item for item in prepared if item is not None)
 
     def _fill_persistent_run(
         self,
@@ -5199,7 +5140,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         if not selected:
             return False
         run.in_flight.extend(task for task, _borrowed_from in selected)
-        prepared = self._prepare_persistent_selection(model, selected)
+        prepared = prepare_persistent_selection(model, selected)
         session_items = tuple(item.session_item for item in prepared)
         replacement_start = 0
         if run.session is None:
@@ -5380,7 +5321,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         guard_findings = tuple(getattr(result, "guard_findings", ()))
         candidate_name = str(getattr(telemetry_item, "candidate_name", ""))
         verify_prefix_token_count, verify_boundary_reached = (
-            self._recovery_verify_prefix(telemetry_item, result_tokens)
+            recovery_verify_prefix(telemetry_item, result_tokens)
         )
         with self._state_lock:
             producer_waits = tuple(
@@ -5551,24 +5492,6 @@ class ModelWorkerPool(Generic[_ModelT]):
         with self._state_lock:
             self._observer.task_completed(timing)
 
-    @staticmethod
-    def _recovery_verify_prefix(
-        item: object,
-        tokens: tuple[int, ...],
-    ) -> tuple[int, bool]:
-        boundary = getattr(item, "verify_shift_value", None)
-        vocab = getattr(item, "expected_vocab", ())
-        if boundary is None or not vocab:
-            return 0, False
-        for index, token in enumerate(tokens):
-            if not 0 <= token < len(vocab):
-                continue
-            event = vocab[token]
-            if getattr(event, "type", None) == "shift" and int(
-                getattr(event, "value", -1)
-            ) >= int(boundary):
-                return index + 1, True
-        return len(tokens), False
 
     def _fail_persistent_run(
         self,
@@ -5691,12 +5614,6 @@ class ModelWorkerPool(Generic[_ModelT]):
         )
         return model, True
 
-    @staticmethod
-    def _allocator_reserved_bytes(device: torch.device) -> int:
-        return max(
-            int(torch.cuda.memory_allocated(device)),
-            int(torch.cuda.memory_reserved(device)),
-        )
 
     def _load_model(self, key: ModelKey) -> tuple[_ModelT, int]:
         def load_once() -> tuple[_ModelT, int]:
@@ -5706,7 +5623,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 try:
                     torch.cuda.synchronize(device)
                     torch.cuda.reset_peak_memory_stats(device)
-                    baseline = self._allocator_reserved_bytes(device)
+                    baseline = allocator_reserved_bytes(device)
                 except (AssertionError, RuntimeError, ValueError):
                     baseline = None
             model = self._loader(key)
@@ -5715,7 +5632,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             torch.cuda.synchronize(device)
             return model, max(
                 0,
-                self._allocator_reserved_bytes(device) - baseline,
+                allocator_reserved_bytes(device) - baseline,
             )
 
         try:

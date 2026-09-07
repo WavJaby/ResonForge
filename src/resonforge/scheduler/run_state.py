@@ -581,3 +581,44 @@ def task_purpose(task: _BatchTask[_ModelT, Any]) -> str:
     if str(getattr(task.item, "candidate_name", "")) == "bootstrap":
         return "bootstrap"
     return task.job_type
+
+
+def prepare_persistent_selection(
+    model: _ModelT,
+    selected: list[tuple[_BatchTask[_ModelT, Any], _PersistentRun[_ModelT] | None]],
+) -> tuple[PreparedWorkItem, ...]:
+    """Prepare heterogeneous row roles while preserving admission order."""
+    prepared: list[PreparedWorkItem | None] = [None] * len(selected)
+    groups: list[
+        tuple[
+            Callable[
+                [_ModelT, tuple[object, ...]], tuple[PreparedWorkItem, ...]
+            ],
+            list[tuple[int, object]],
+        ]
+    ] = []
+    for index, (task, _borrowed_from) in enumerate(selected):
+        if task.prepare is None:
+            prepared[index] = PreparedWorkItem(task.item)
+            continue
+        group = next(
+            (entries for strategy, entries in groups if strategy is task.prepare),
+            None,
+        )
+        if group is None:
+            group = []
+            groups.append((task.prepare, group))
+        group.append((index, task.item))
+
+    for strategy, entries in groups:
+        batch = strategy(model, tuple(item for _index, item in entries))
+        if len(batch) != len(entries):
+            raise RuntimeError("persistent preparation returned the wrong row count")
+        if any(not isinstance(item, PreparedWorkItem) for item in batch):
+            raise TypeError("persistent preparation returned an untyped row")
+        for (index, _item), prepared_item in zip(entries, batch, strict=True):
+            prepared[index] = prepared_item
+
+    if any(item is None for item in prepared):
+        raise RuntimeError("persistent preparation left an unresolved row")
+    return tuple(item for item in prepared if item is not None)

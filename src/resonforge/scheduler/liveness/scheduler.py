@@ -651,3 +651,45 @@ def validate_scheduler_state(state: SchedulerState) -> None:
             raise SchedulerInvariantError(
                 f"run {run.run_id} resident handle has duplicate control intent"
             )
+
+
+def preferred_actions(
+    actions: tuple[SchedulerAction, ...],
+) -> dict[int, SchedulerAction]:
+    """Apply run-local policy only after pure legality is established."""
+    order = {
+        SchedulerActionKind.CANCEL: 0,
+        SchedulerActionKind.DISCARD: 1,
+        SchedulerActionKind.CAPACITY_PREPARE: 2,
+        # Beside capacity preparation, same reason: both settle how many rows this lane holds before anything is admitted into them.
+        # Above admission deliberately -- a lane that admits first never reaches the empty slot set a resize needs, so below `condition_prefill` growth is unreachable for any lane that has work.
+        SchedulerActionKind.RESIZE: 2,
+        SchedulerActionKind.RELEASE_ADMIT: 2,
+        SchedulerActionKind.BUNDLE_ADMIT: 2,
+        SchedulerActionKind.PREFILL: 2,
+        SchedulerActionKind.RESTORE: 3,
+        SchedulerActionKind.PREEMPT_RESTORE: 4,
+        SchedulerActionKind.PREEMPT_CONDITION: 5,
+        SchedulerActionKind.CONDITION_BATCH: 7,
+        SchedulerActionKind.CONDITION_PREFILL: 8,
+        SchedulerActionKind.ADMIT: 9,
+        SchedulerActionKind.DECODE: 10,
+        SchedulerActionKind.FAIL: 11,
+    }
+    global_condition = {
+        participant: action
+        for action in actions
+        if action.kind is SchedulerActionKind.CONDITION_BATCH
+        for participant in action.participants
+    }
+    selected: dict[int, SchedulerAction] = {}
+    for action in actions:
+        if (
+            action.kind is SchedulerActionKind.CONDITION_PREFILL
+            and action.run_id in global_condition
+        ):
+            continue
+        current = selected.get(action.run_id)
+        if current is None or order[action.kind] < order[current.kind]:
+            selected[action.run_id] = action
+    return selected

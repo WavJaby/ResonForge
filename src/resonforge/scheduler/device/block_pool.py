@@ -611,3 +611,11 @@ def reset_device_block_pools() -> None:
     """Drop every pool. For tests and process teardown only."""
     with _POOLS_LOCK:
         _POOLS.clear()
+
+
+def device_ceiling(cost: ArenaCost, available_blocks: int) -> int:
+    """The widest the free blocks could cover, used where no ceiling exists."""
+    return max(
+        cost.minimum_width,
+        max(0, available_blocks) * BLOCK_BYTES // max(1, cost.row_bytes),
+    )
