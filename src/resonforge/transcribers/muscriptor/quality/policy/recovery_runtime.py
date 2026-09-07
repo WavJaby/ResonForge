@@ -732,6 +732,105 @@ def _candidate_pair(
     )
 
 
+def _verify_at_checkpoint(
+    stem: _StemContext,
+    chunk: _ChunkContext,
+    pair: _CandidatePair,
+    recovery_results: object,
+) -> dict[str, _VerificationCandidateState]:
+    """Score both candidates on the prefix they reached before their checkpoint, against the previous chunk.
+
+    Pure. The diagnostics here are CHECKPOINT diagnostics: a candidate that later resumes replaces its own with a completed one."""
+    model = stem.model
+    previous_tokens = chunk.previous_tokens
+    previous_seek = chunk.previous_seek
+    verification_start = chunk.verification_start
+    verification_end = chunk.verification_end
+    secondary_name = pair.secondary_name
+    shifted_seek = pair.shifted_seek
+    secondary_seek = pair.secondary_seek
+    shifted_request = pair.shifted_request
+    secondary_request = pair.secondary_request
+
+    if (
+        not isinstance(recovery_results, tuple)
+        or len(recovery_results) != 2
+        or not all(
+            isinstance(result, RecoveryCandidateResult)
+            for result in recovery_results
+        )
+    ):
+        raise TypeError(
+            "recovery candidate group requires compatible results"
+        )
+    shifted_result, external_secondary = recovery_results
+
+    candidate_results = {
+        "shifted_replay": shifted_result,
+        secondary_name: external_secondary,
+    }
+    candidate_requests = {
+        "shifted_replay": shifted_request,
+        secondary_name: secondary_request,
+    }
+    candidate_states: dict[str, _VerificationCandidateState] = {}
+    for name, result in candidate_results.items():
+        request = candidate_requests[name]
+        full_tokens = list(result.tokens)
+        origin = (
+            shifted_seek if name == "shifted_replay" else secondary_seek
+        )
+        prompt_length = len(request.prompt_ids)
+        checkpoint_shift = round(
+            (verification_end - origin) * model._tokenizer.frame_rate
+        )
+        evaluation_tokens, reached_checkpoint = (
+            _candidate_checkpoint_prefix(
+                full_tokens,
+                model._tokenizer._vocab,
+                checkpoint_shift,
+            )
+        )
+        abort_reason = _critical_guard_reason(result.guard_findings)
+        diagnostic = evaluate_candidate(
+            name,
+            evaluation_tokens,
+            prompt_length,
+            result.emitted_eos if not reached_checkpoint else False,
+            model._tokenizer._vocab,
+            verification_match=overlap_runtime.match_verification(
+                model._tokenizer,
+                previous_tokens,
+                previous_seek,
+                evaluation_tokens,
+                origin,
+                verification_start,
+                verification_end,
+            ),
+            allow_missing_eos=reached_checkpoint,
+            forced_invalid_reason=abort_reason,
+            model_name=result.model_name,
+            sampling=request.use_sampling,
+            condition_seek_time=origin,
+            guard_findings=result.guard_findings,
+        )
+        candidate_states[name] = _VerificationCandidateState(
+            request=request,
+            origin=origin,
+            tokens=full_tokens,
+            evaluation_tokens=evaluation_tokens,
+            prompt_length=prompt_length,
+            ended=result.emitted_eos,
+            reached_checkpoint=reached_checkpoint,
+            handle=result.resident_handle,
+            diagnostic=diagnostic,
+            abort_reason=abort_reason,
+            guard_summary=result.guard_summary,
+            guard_findings=result.guard_findings,
+        )
+    return candidate_states
+
+
 def _recover_chunk(
     stem: _StemContext,
     config: _RecoveryConfig,
@@ -805,8 +904,6 @@ def _recover_chunk(
         pair = _candidate_pair(stem, config, chunk)
         seed = pair.seed
         secondary_name = pair.secondary_name
-        shifted_seek = pair.shifted_seek
-        secondary_seek = pair.secondary_seek
         shifted_request = pair.shifted_request
         secondary_request = pair.secondary_request
 
@@ -814,82 +911,7 @@ def _recover_chunk(
             (shifted_request, secondary_request),
             parent_resident_handle=primary_handle,
         )
-        if (
-            not isinstance(recovery_results, tuple)
-            or len(recovery_results) != 2
-            or not all(
-                isinstance(result, RecoveryCandidateResult)
-                for result in recovery_results
-            )
-        ):
-            raise TypeError(
-                "recovery candidate group requires compatible results"
-            )
-        shifted_result, external_secondary = recovery_results
-
-        candidate_results = {
-            "shifted_replay": shifted_result,
-            secondary_name: external_secondary,
-        }
-        candidate_requests = {
-            "shifted_replay": shifted_request,
-            secondary_name: secondary_request,
-        }
-        candidate_states: dict[str, _VerificationCandidateState] = {}
-        for name, result in candidate_results.items():
-            request = candidate_requests[name]
-            full_tokens = list(result.tokens)
-            origin = (
-                shifted_seek if name == "shifted_replay" else secondary_seek
-            )
-            prompt_length = len(request.prompt_ids)
-            checkpoint_shift = round(
-                (verification_end - origin) * model._tokenizer.frame_rate
-            )
-            evaluation_tokens, reached_checkpoint = (
-                _candidate_checkpoint_prefix(
-                    full_tokens,
-                    model._tokenizer._vocab,
-                    checkpoint_shift,
-                )
-            )
-            abort_reason = _critical_guard_reason(result.guard_findings)
-            diagnostic = evaluate_candidate(
-                name,
-                evaluation_tokens,
-                prompt_length,
-                result.emitted_eos if not reached_checkpoint else False,
-                model._tokenizer._vocab,
-                verification_match=overlap_runtime.match_verification(
-                    model._tokenizer,
-                    previous_tokens,
-                    previous_seek,
-                    evaluation_tokens,
-                    origin,
-                    verification_start,
-                    verification_end,
-                ),
-                allow_missing_eos=reached_checkpoint,
-                forced_invalid_reason=abort_reason,
-                model_name=result.model_name,
-                sampling=request.use_sampling,
-                condition_seek_time=origin,
-                guard_findings=result.guard_findings,
-            )
-            candidate_states[name] = _VerificationCandidateState(
-                request=request,
-                origin=origin,
-                tokens=full_tokens,
-                evaluation_tokens=evaluation_tokens,
-                prompt_length=prompt_length,
-                ended=result.emitted_eos,
-                reached_checkpoint=reached_checkpoint,
-                handle=result.resident_handle,
-                diagnostic=diagnostic,
-                abort_reason=abort_reason,
-                guard_summary=result.guard_summary,
-                guard_findings=result.guard_findings,
-            )
+        candidate_states = _verify_at_checkpoint(stem, chunk, pair, recovery_results)
 
         assert primary_diagnostic is not None
         checkpoint_selection = select_checkpoint_candidate(
