@@ -17,7 +17,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field, fields, replace
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic
 
 import torch
 
@@ -66,9 +66,20 @@ from resonforge.scheduler.model_types import (
     TransitiveDependencyClaim,
 )
 from resonforge.scheduler.observer import SchedulerObserver
-
-_ModelT = TypeVar("_ModelT")
-_ResultT = TypeVar("_ResultT")
+from resonforge.scheduler.run_state import (
+    _BatchTask,
+    _ModelT,
+    _PendingPrefill,
+    _PersistentRun,
+    _ResultT,
+    _RunTelemetry,
+    _WidthBound,
+    task_decode_budget,
+    task_prefill_budget,
+    task_purpose,
+    task_requires_dependency_credit,
+    task_schedule_key,
+)
 
 _LOGGER = logging.getLogger(__name__)
 # How often a submitter re-tests the arena-declaration contradiction while waiting.
@@ -294,12 +305,6 @@ def _is_resident_generation_control(item: object) -> bool:
     ) in {"resume", "discard"}
 
 
-@dataclass
-class _PendingPrefill(Generic[_ModelT]):
-    """Condition-complete rows waiting for their independent KV-prefill turn."""
-
-    selected: tuple[tuple[_BatchTask[_ModelT, Any], PreparedWorkItem], ...]
-    conditioned: object
 
 
 @dataclass
@@ -456,216 +461,6 @@ class _Task(Generic[_ModelT, _ResultT]):
     trace_model_load: bool = False
 
 
-@dataclass
-class _BatchTask(Generic[_ModelT, _ResultT]):
-    sequence: int
-    key: ModelKey
-    priority: int
-    job_type: GenerationJobType
-    submitted_at: float
-    compatibility_key: object
-    item: object
-    max_batch_size: int
-    future: Future[_ResultT]
-    condition_compatibility_key: object | None = None
-    arena_cost: ArenaCostProbe | None = None
-    kv_pool: KVPoolDeclaration | None = None
-    minimum_width: int = 1
-    maximum_width: int | None = None
-    pipeline_session_id: str | None = None
-    batch_dimension: int | None = None
-    continuous_factory: Callable[..., object] | None = None
-    prepare: (
-        Callable[[_ModelT, tuple[object, ...]], tuple[PreparedWorkItem, ...]] | None
-    ) = None
-    continuous_replacement: bool = True
-    ready_order: str = ""
-    dependency_claim: TransitiveDependencyClaim | None = None
-    dependency_bundle_id: int | None = None
-    dependency_bundle_index: int | None = None
-    inherited_claim_token: DependencyClaimToken | None = None
-
-
-@dataclass
-class _ResumableSession(Protocol):
-    """Model-specific session driven one bounded quantum at a time."""
-
-    active_count: int
-    occupied_count: int
-    available_count: int
-    session_id: int
-    remaining_decode_token_budget: int
-    next_completion_token_budget: int | None
-
-    def admit(self, item: object) -> bool: ...
-
-    def admit_many(self, items: tuple[object, ...]) -> bool: ...
-
-    def run_quantum(
-        self,
-        max_steps: int,
-        completed: Callable[[object, object], None],
-        checkpointed: Callable[[object, object], None] | None = None,
-    ) -> object: ...
-
-    def resume(self, handle: object) -> object: ...
-
-    def discard(self, handle: object) -> object: ...
-
-    #: The outcome to publish for a control action this session executed. The
-    #: scheduler decides *that* a row is discarded; the result type saying so
-    #: belongs to the backend, and building one here is what made the
-    #: scheduler import its transcriber.
-    def control_outcome(self, *, discarded: bool) -> object: ...
-
-    def can_resume(self, handle: object) -> bool: ...
-
-    def preempt_for_admission(self) -> bool: ...
-
-    def can_preempt_for_admission(self) -> bool: ...
-
-    def is_displaced(self, handle: object) -> bool: ...
-
-    def close(self) -> None: ...
-
-
-@dataclass(frozen=True)
-class _WidthBound:
-    """The widest arena each of the two conservation laws allows on its own."""
-
-    bytes_width: int
-    kv_width: int
-
-    @property
-    def width(self) -> int:
-        return min(self.bytes_width, self.kv_width)
-
-
-@dataclass
-class _RunTelemetry:
-    """What the execution path accumulates and the reporting path reads. Never a decision input.
-
-    Split out of `_PersistentRun` on measurement, not taste: of its 63 fields these 27 were read by exactly two method clusters -- execute writes them, observability reads them --
-    and by nothing that chooses an action. Everything left on the run participates in a decision.
-
-    Reset AS A WHOLE (`run.stats = _RunTelemetry()`) when a task publishes its stats. It was 27 hand-written clears, which is one forgotten line away from a counter
-    that silently never resets and reports a run's totals as the process's.
-
-    Rates rather than totals, and drained rather than read, are the callers' business -- see `ModelTaskTiming`. What this owns is that the set has one name and one lifetime.
-    """
-
-    physical_steps: int = 0
-    #: Device tokens computed past a row's own stop -- EOS, temporal-floor break, max_gen_len -- inside a quantum. Checkpoint overrun is NOT waste (retained as `pending_tokens`).
-    #: Load-bearing for S5 (host-async decode): speculation waste lands here, and the q8 overshoot reading was unconfirmed for lack of exactly this counter.
-    wasted_token_rows: int = 0
-    active_steps_by_width: dict[int, int] = field(default_factory=dict)
-    prefill_batches_by_width: dict[int, int] = field(default_factory=dict)
-    condition_batches_by_width: dict[int, int] = field(default_factory=dict)
-    first_token_batches_by_width: dict[int, int] = field(default_factory=dict)
-    packed_prefill_batches_by_width: dict[int, int] = field(default_factory=dict)
-    quantum_steps_by_size: dict[int, int] = field(default_factory=dict)
-    scheduler_decision_cpu_seconds: float = 0.0
-    scheduler_decision_phase_seconds: dict[str, float] = field(default_factory=dict)
-    scheduler_action_wall_seconds: dict[str, float] = field(default_factory=dict)
-    scheduler_boundary_gap_seconds: float = 0.0
-    scheduler_boundary_gap_count: int = 0
-    phase_gpu_ms: dict[str, float] = field(default_factory=dict)
-    cuda_graph_captures: int = 0
-    cuda_graph_replays: int = 0
-    cuda_graph_refusals: int = 0
-    cuda_graph_evictions: int = 0
-    cuda_graph_variants: dict[str, dict[str, int]] = field(default_factory=dict)
-    cuda_graph_cache_entries_peak: int = 0
-    cuda_graph_cache_static_bytes_peak: int = 0
-    cuda_graph_cache_pool_bytes_peak: int = 0
-    #: Gauges, not counters: the prefill graph cache outlives a session, so these are assigned from its running totals rather than accumulated here.
-    prefill_graph: dict[str, int] = field(default_factory=dict)
-    prefill_graph_refusals: dict[str, int] = field(default_factory=dict)
-    scheduler_gauges: dict[str, int] = field(default_factory=dict)
-    scheduler_state_histograms: dict[str, Counter[int]] = field(default_factory=dict)
-    hot_replacements: int = 0
-    borrowed_admissions: int = 0
-
-
-@dataclass
-class _PersistentRun(Generic[_ModelT]):
-    """Worker-owned session plus unresolved ready and active task state."""
-
-    key: ModelKey
-    priority: int
-    compatibility_key: object
-    capacity: int
-    width: int
-    factory: Callable[[_ModelT, tuple[object, ...], int, int], _ResumableSession]
-    allow_replacement: bool
-    # How this lane prices a row, and the floor it keeps. `None` means the
-    # lane is unpriced: no device bounds it and the pool never refuses it.
-    arena_cost_probe: ArenaCostProbe | None = None
-    # Declares the KV supply this lane's arenas draw from, once the width is
-    # resolved. `None` leaves arenas private -- exactly today's behaviour.
-    kv_pool_declaration: KVPoolDeclaration | None = None
-    minimum_width: int = 1
-    maximum_width: int | None = None
-    # Widest this lane had work for during its last batch. P4's input: `demand_width` asks for this, not instantaneous ready width, which is lumpy (5.26 mean vs peak 13 on one lane) and would resize on every dip.
-    #
-    # What a growth attempt was actually funded at when it came back narrower than asked; 0 = no such attempt stands.
-    # Caps later targets so the scheduler doesn't re-select a resize the supply already refused.
-    # Cleared the moment a resize does move the width -- the device is shared, so a refusal is a reading, not a property of the lane.
-    width_funded_ceiling: int = 0
-    # Reset at each RESIZE to the queue standing then, and nowhere else.
-    # Resetting when the lane goes owner-free sounds equivalent (both are phase boundaries) and isn't: owner-free is when the lane just finished everything, so it reads the trough,
-    # and the peak this exists to remember is gone before anything can act on it. Measured (R12).
-    demand_high_water: int = 0
-    # resolved once at capacity preparation, by asking the loaded model
-    arena_cost: ArenaCost | None = None
-    # blocks this run's arena occupies once resident
-    arena_blocks: int = 0
-    # Backend's own ceiling, kept apart from the live width.
-    # Solving against `width` instead makes narrowing permanent -- a run that once opened narrow could never widen again, the residual ratchet rebuilt out of a different variable.
-    width_ceiling: int = 0
-    # set once the lane's row cost is measured. Replaces `capacity_source`, which named which of three prediction paths produced a width; there is one path now and it is measurement.
-    capacity_resolved: bool = False
-    purposes: set[str] = field(default_factory=set)
-    pending: list[_BatchTask[_ModelT, Any]] = field(default_factory=list)
-    pending_controls: list[_BatchTask[_ModelT, Any]] = field(default_factory=list)
-    in_flight: list[_BatchTask[_ModelT, Any]] = field(default_factory=list)
-    prefill_pending: list[_PendingPrefill[_ModelT]] = field(default_factory=list)
-    active_by_item: dict[int, tuple[_BatchTask[_ModelT, Any], PreparedWorkItem]] = (
-        field(default_factory=dict)
-    )
-    # (handle, own checkpoint credit bytes, blocks its claim's members owe).
-    # The third element is what makes the whole-claim guarantee survive the
-    # parent parking: see `_move_task_credit_to_handle`.
-    resident_handles_by_key: dict[tuple[int, int, int], object] = field(
-        default_factory=dict
-    )
-    session: _ResumableSession | None = None
-    age: int = 0
-    stats: _RunTelemetry = field(default_factory=_RunTelemetry)
-    scheduler_observations: Counter[str] = field(default_factory=Counter)
-    started_at: dict[int, float] = field(default_factory=dict)
-    model_loaded: bool = False
-    quantum_count: int = 0
-    capacity_resident_bytes: int = 0
-    capacity_graph_static_bytes: int = 0
-    capacity_total_bytes: int = 0
-    measured_row_bytes: int = 0
-
-    @property
-    def logical_available_count(self) -> int:
-        if self.session is None:
-            return self.width
-        committed_prefill = sum(
-            len(batch.selected) for batch in self.prefill_pending
-        )
-        return max(
-            0,
-            min(
-                self.session.available_count,
-                self.width - self.session.occupied_count,
-            )
-            - committed_prefill,
-        )
 
 
 @dataclass(frozen=True)
@@ -2384,7 +2179,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 for run in runs_by_id.values()
                 for session_id in gather(
                     "pipeline_session_ids",
-                    lambda run=run: self._run_pipeline_session_ids(run),
+                    lambda run=run: run.pipeline_session_ids(),
                     (),
                 )
             }
@@ -2442,7 +2237,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             "observations": gather(
                 "observations",
                 lambda: {
-                    self._session_label(run): dict(run.scheduler_observations)
+                    run.session_label(): dict(run.scheduler_observations)
                     for run in self._persistent_runs.values()
                     if run.scheduler_observations
                 },
@@ -2576,7 +2371,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             snapshots.append(
                 {
                     "model": run.key.model,
-                    "job_types": sorted(self._run_job_types(run)),
+                    "job_types": sorted(run.job_types()),
                     "kv_capacity": run.capacity,
                     "session_id": (None if session is None else session.session_id),
                     "pending": len(run.pending),
@@ -2647,7 +2442,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 maximum_width=task.maximum_width,
                 factory=task.continuous_factory,
                 allow_replacement=task.continuous_replacement,
-                purposes={self._task_purpose(task)},
+                purposes={task_purpose(task)},
             )
             self._persistent_runs[key] = run
         else:
@@ -2658,22 +2453,10 @@ class ModelWorkerPool(Generic[_ModelT]):
             if task.maximum_width != run.maximum_width:
                 raise RuntimeError("persistent lane maximum width changed")
             run.priority = min(run.priority, task.priority)
-            run.purposes.add(self._task_purpose(task))
+            run.purposes.add(task_purpose(task))
         run.pending.append(task)
 
-    @staticmethod
-    def _task_purpose(task: _BatchTask[_ModelT, Any]) -> str:
-        if str(getattr(task.item, "candidate_name", "")) == "bootstrap":
-            return "bootstrap"
-        return task.job_type
 
-    @staticmethod
-    def _session_label(run: _PersistentRun[_ModelT]) -> str:
-        order = {"bootstrap": 0, "primary": 1, "recovery": 2, "control": 3}
-        purposes = "/".join(
-            sorted(run.purposes, key=lambda value: (order.get(value, 9), value))
-        )
-        return f"{run.key.model} {purposes}".rstrip()
 
     def _enqueue_generation_control(
         self,
@@ -2723,7 +2506,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         was_displaced = bool(callable(is_displaced) and is_displaced(handle))
         handle_key = self._resident_handle_key(handle)
         operation_started = time.perf_counter()
-        slots_before = self._waterfall_slots(run)
+        slots_before = run.waterfall_slots()
         with self._state_lock:
             if not task.future.set_running_or_notify_cancel():
                 self._pending.pop(task.sequence, None)
@@ -2741,7 +2524,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             run.session.discard(handle)
             run.resident_handles_by_key.pop(handle_key, None)
             self._complete_inherited_claim_control(task, None)
-            self._refresh_capacity_measurement(run)
+            run.refresh_capacity_measurement()
             if was_displaced:
                 run.scheduler_observations["displaced_row_discards"] += 1
             outcome = run.session.control_outcome(discarded=True)
@@ -2757,7 +2540,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             return
         request = run.session.resume(handle)
         run.resident_handles_by_key.pop(handle_key, None)
-        self._refresh_capacity_measurement(run)
+        run.refresh_capacity_measurement()
         if was_displaced:
             run.scheduler_observations["displaced_row_restores"] += 1
         run.active_by_item[id(request)] = (
@@ -2772,18 +2555,6 @@ class ModelWorkerPool(Generic[_ModelT]):
             handle_key=handle_key,
         )
 
-    def _collect_preemption_telemetry(self, run: _PersistentRun[_ModelT]) -> None:
-        """Move what preemption cost this run's session into its observations.
-
-        Called once per quantum and once more wherever the session is about to be let go, so nothing is attributed to a run that didn't incur it and nothing is dropped because the last quantum was the one that preempted.
-        Not bracketed around a single action on purpose: the admission path preempts too, and bracketing decode alone is what reported a run's 66 preemptions as none.
-        """
-        drain = getattr(run.session, "drain_preemption_telemetry", None)
-        if not callable(drain):
-            return
-        for name, value in dict(drain()).items():
-            if value:
-                run.scheduler_observations[name] += int(value)
 
     def _drive_persistent_quantum(
         self,
@@ -2821,7 +2592,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             run_id for run_id, candidate in runs_by_id.items() if candidate is run
         )
         selected_action = preferred_by_id[selected_id]
-        self._collect_preemption_telemetry(run)
+        run.collect_preemption_telemetry()
         policy_finished = time.perf_counter()
         self._accumulate_seconds(
             run.stats.scheduler_decision_phase_seconds,
@@ -2851,7 +2622,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         )
         action = selected_action.kind.value
         operation_started = time.perf_counter()
-        slots_before = self._waterfall_slots(run)
+        slots_before = run.waterfall_slots()
         waterfall_action = (
             "session_init"
             if action == "condition_prefill" and run.session is None
@@ -3038,7 +2809,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 )
             if action in {"preempt_restore", "preempt_condition"}:
                 assert run.session is not None
-                self._refresh_capacity_measurement(run)
+                run.refresh_capacity_measurement()
                 if action == "preempt_condition" and not self._preempt_condition_resources_fit(
                     run,
                     refresh_device=True,
@@ -3065,7 +2836,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 # counts this event, and `selected_action_preempt_condition_
                 # observations` counts the action that causes it -- three
                 # names for one thing was two too many.
-                self._refresh_capacity_measurement(run)
+                run.refresh_capacity_measurement()
                 if action == "preempt_restore":
                     task = run.pending_controls.pop(0)
                     self._execute_generation_control(
@@ -3082,14 +2853,14 @@ class ModelWorkerPool(Generic[_ModelT]):
                             "the preempt macro consumed no pending row"
                         )
                     if deferred_prefill:
-                        self._admit_conditioned_batch(run)
+                        run.admit_conditioned_batch()
                 return ActionResult(
                     ActionResultStatus.APPLIED,
                     selected_action,
                     state.version,
                 )
             if run.prefill_pending:
-                self._admit_conditioned_batch(run)
+                run.admit_conditioned_batch()
                 return ActionResult(
                     ActionResultStatus.APPLIED,
                     selected_action,
@@ -3121,7 +2892,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                         reason="condition/prefill transaction admitted no row",
                     )
                 if deferred_prefill:
-                    self._admit_conditioned_batch(run)
+                    run.admit_conditioned_batch()
                 return ActionResult(
                     ActionResultStatus.APPLIED,
                     selected_action,
@@ -3172,7 +2943,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 if drain_batches is not None:
                     for width, count in dict(drain_batches()).items():
                         target[int(width)] = target.get(int(width), 0) + int(count)
-            self._drain_phase_gpu_ms(run, session)
+            run.drain_phase_gpu_ms(session)
             # Keep one hot graph-quantum family. q8 was tried and reverted: it
             # delivers every mechanical thing it promises -- far fewer
             # dispatches, less idle between actions, higher kernel residency --
@@ -3310,7 +3081,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 run.stats.cuda_graph_cache_pool_bytes_peak,
                 int(cache_after.get("pool_bytes", 0)),
             )
-            self._drain_phase_gpu_ms(run, session)
+            run.drain_phase_gpu_ms(session)
         except BaseException as error:
             failure = (
                 error
@@ -3341,7 +3112,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                     model_started,
                     model_finished,
                     pipeline_session_id=(
-                        next(iter(self._run_pipeline_session_ids(run)), None)
+                        next(iter(run.pipeline_session_ids()), None)
                     ),
                 )
             if session_first_decode_span is not None and self._observer.trace_spans:
@@ -3351,10 +3122,10 @@ class ModelWorkerPool(Generic[_ModelT]):
                     first_decode_started,
                     first_decode_finished,
                     resource="gpu",
-                    lane=f"{self._session_label(run)} init",
+                    lane=f"{run.session_label()} init",
                     model=run.key.model,
                     session_id=run.session.session_id,
-                    session_label=self._session_label(run),
+                    session_label=run.session_label(),
                 )
             self._record_waterfall_event(
                 run,
@@ -3364,7 +3135,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                 dispatch_readiness=dispatch_readiness,
             )
         if stats is not None:
-            self._accumulate_quantum_stats(run, stats)
+            run.accumulate_quantum_stats(stats)
         self._publish_quantum_completions(run, completed)
         return ActionResult(
             ActionResultStatus.APPLIED,
@@ -3372,19 +3143,6 @@ class ModelWorkerPool(Generic[_ModelT]):
             state.version,
         )
 
-    def _accumulate_quantum_stats(
-        self,
-        run: _PersistentRun[_ModelT],
-        stats: object,
-    ) -> None:
-        """Fold one consumed quantum's session stats into the run's telemetry."""
-        run.quantum_count += 1
-        run.stats.physical_steps += int(getattr(stats, "physical_steps", 0))
-        run.stats.wasted_token_rows += int(getattr(stats, "wasted_token_rows", 0))
-        for width, steps in dict(getattr(stats, "active_steps_by_width", {})).items():
-            run.stats.active_steps_by_width[int(width)] = run.stats.active_steps_by_width.get(
-                int(width), 0
-            ) + int(steps)
 
     def _publish_quantum_completions(
         self,
@@ -3404,7 +3162,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                     run,
                     "checkpoint",
                     checkpoint_started,
-                    self._waterfall_slots(run),
+                    run.waterfall_slots(),
                     handle_key=self._resident_handle_key(resident_handle),
                 )
             task, prepared = run.active_by_item.pop(id(item))
@@ -3474,13 +3232,13 @@ class ModelWorkerPool(Generic[_ModelT]):
             return
         completed: list[tuple[object, object]] = []
         drain_started = time.perf_counter()
-        slots_before = self._waterfall_slots(run)
+        slots_before = run.waterfall_slots()
         stats = session.consume_quantum(
             lambda item, result: completed.append((item, result)),
             checkpointed=lambda item, result: completed.append((item, result)),
         )
         self._last_decode_quantum_finished_at = time.perf_counter()
-        self._accumulate_quantum_stats(run, stats)
+        run.accumulate_quantum_stats(stats)
         self._record_waterfall_event(run, "decode", drain_started, slots_before)
         self._publish_quantum_completions(run, completed)
 
@@ -3498,7 +3256,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             raise RuntimeError("global condition batch crossed model identity")
         if any(not run.pending for run in cohort):
             return "condition cohort changed before execution"
-        selected = [(run, self._ordered_pending(run)[0]) for run in cohort]
+        selected = [(run, run.ordered_pending()[0]) for run in cohort]
         condition_key = selected[0][1].condition_compatibility_key
         if condition_key is None or any(
             task.condition_compatibility_key != condition_key
@@ -3581,31 +3339,6 @@ class ModelWorkerPool(Generic[_ModelT]):
                 return True
         return False
 
-    @staticmethod
-    def _waterfall_slots(run: _PersistentRun[_ModelT]) -> list[dict[str, object]]:
-        if run.session is None:
-            return []
-        slots: list[dict[str, object]] = []
-        for index, slot in enumerate(getattr(run.session, "slots", ())):
-            row = getattr(slot, "row", None)
-            if row is None:
-                continue
-            request = getattr(row, "request", None)
-            task_entry = run.active_by_item.get(id(request))
-            task = None if task_entry is None else task_entry[0]
-            slots.append(
-                {
-                    "session_id": run.session.session_id,
-                    "slot": index,
-                    "sequence": None if task is None else task.sequence,
-                    "job_type": None if task is None else task.job_type,
-                    "pipeline_session_id": (
-                        None if task is None else task.pipeline_session_id
-                    ),
-                    "paused": bool(getattr(slot, "paused", False)),
-                }
-            )
-        return slots
 
     def _record_waterfall_event(
         self,
@@ -3624,7 +3357,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         if session is None:
             return
         finished_at = time.perf_counter() if finished_at is None else finished_at
-        slots_after = self._waterfall_slots(run)
+        slots_after = run.waterfall_slots()
         owners = sorted(
             {
                 str(slot["pipeline_session_id"])
@@ -3632,14 +3365,14 @@ class ModelWorkerPool(Generic[_ModelT]):
                 if slot.get("pipeline_session_id")
             }
         )
-        condition_ready, prefill_ready, decode_ready = self._run_phase_depths(run)
+        condition_ready, prefill_ready, decode_ready = run.record_phase_depths()
         self._observer.record(
             {
                 "start_seconds": self._observer.relative_time(started_at),
                 "end_seconds": self._observer.relative_time(finished_at),
                 "action": action,
                 "session_id": session.session_id,
-                "session_label": self._session_label(run),
+                "session_label": run.session_label(),
                 "pipeline_session_id": owners[0] if len(owners) == 1 else None,
                 "pipeline_session_ids": owners,
                 "model": run.key.model,
@@ -3697,84 +3430,13 @@ class ModelWorkerPool(Generic[_ModelT]):
             pipeline_session_id=pipeline_session_id,
         )
 
-    @staticmethod
-    def _run_pipeline_session_ids(run: _PersistentRun[_ModelT]) -> set[str]:
-        return {
-            str(task.pipeline_session_id)
-            for task in ModelWorkerPool._persistent_run_tasks(run)
-            if getattr(task, "pipeline_session_id", None) is not None
-        }
 
-    @staticmethod
-    def _persistent_run_tasks(
-        run: _PersistentRun[_ModelT],
-    ) -> tuple[_BatchTask[_ModelT, Any], ...]:
-        return (
-            *run.pending,
-            *run.pending_controls,
-            *run.in_flight,
-            *(task for batch in run.prefill_pending for task, _item in batch.selected),
-            *(task for task, _item in run.active_by_item.values()),
-        )
 
-    @staticmethod
-    def _run_job_types(run: _PersistentRun[_ModelT]) -> set[GenerationJobType]:
-        return {
-            getattr(task, "job_type", "primary")
-            for task in ModelWorkerPool._persistent_run_tasks(run)
-        }
 
-    @staticmethod
-    def _task_schedule_key(task: _BatchTask[_ModelT, Any]) -> tuple[object, ...]:
-        return (
-            getattr(task, "priority", 10),
-            0 if getattr(task, "dependency_bundle_id", None) is not None else 1,
-            getattr(task, "sequence", 0),
-            getattr(task, "ready_order", ""),
-        )
 
-    @classmethod
-    def _ordered_pending(
-        cls,
-        run: _PersistentRun[_ModelT],
-    ) -> list[_BatchTask[_ModelT, Any]]:
-        return sorted(run.pending, key=cls._task_schedule_key)
 
-    @classmethod
-    def _run_priority(cls, run: _PersistentRun[_ModelT]) -> int:
-        tasks = cls._persistent_run_tasks(run)
-        return min(
-            (getattr(task, "priority", run.priority) for task in tasks),
-            default=run.priority,
-        )
 
-    @staticmethod
-    def _phase_depths(run: _PersistentRun[_ModelT]) -> tuple[int, int, int]:
-        """The three depths, with no side effect. **The one definition.**
 
-        Split out from `_run_phase_depths` so a second reader can sample them
-        without also moving `demand_high_water`, which P4 sizes an arena from:
-        a telemetry sample that changes an allocation is two variables, not one.
-        """
-        return (
-            len(run.pending),
-            sum(len(batch.selected) for batch in run.prefill_pending),
-            run.session.active_count if run.session is not None else 0,
-        )
-
-    @staticmethod
-    def _run_phase_depths(run: _PersistentRun[_ModelT]) -> tuple[int, int, int]:
-        condition_ready, prefill_ready, decode_ready = (
-            ModelWorkerPool._phase_depths(run)
-        )
-        # Recorded here because this is the one place the three depths are
-        # resolved together, and their sum is the demand P4 sizes against. A
-        # second definition elsewhere is how "ready width" would come to mean
-        # two things.
-        run.demand_high_water = max(
-            run.demand_high_water, condition_ready + prefill_ready + decode_ready
-        )
-        return condition_ready, prefill_ready, decode_ready
 
     def _dispatch_readiness(self, run: _PersistentRun[_ModelT]) -> dict[str, int]:
         """Width and readiness at ONE instant, sampled at quantum dispatch.
@@ -3803,7 +3465,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         """
         session = run.session
         condition_ready, prefill_ready, decode_ready = (
-            ModelWorkerPool._phase_depths(run)
+            run.phase_depths()
         )
         identity = id(run)
         bound = unbound = 0
@@ -3928,7 +3590,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         preempt_finished_at = time.perf_counter()
         condition_group = None
         if run.session is not None and run.pending:
-            condition_task = self._ordered_pending(run)[0]
+            condition_task = run.ordered_pending()[0]
             condition_key = getattr(
                 condition_task,
                 "condition_compatibility_key",
@@ -3948,7 +3610,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             wanted = self._run_demand_width(run, pool)
             if wanted != run.width:
                 resize_target = wanted
-                resize_delta = self._arena_blocks(run, wanted) - run.arena_blocks
+                resize_delta = run.arena_blocks_at(wanted) - run.arena_blocks
         state = SchedulerRunState(
             run_id=run_id,
             physical_width=run.width,
@@ -4096,10 +3758,9 @@ class ModelWorkerPool(Generic[_ModelT]):
             ("pool_free_mib", free_bytes, 64),
         ):
             quantum = bucket_mib * 1024**2
-            self._observe_scheduler_histogram(
-                subject, name, value // quantum * bucket_mib
+            subject.observe_scheduler_histogram(name, value // quantum * bucket_mib
             )
-        self._observe_scheduler_histogram(subject, "pool_resident_rows", rows_now)
+        subject.observe_scheduler_histogram("pool_resident_rows", rows_now)
         if rows_now not in pool.measured_widths():
             # Priced by the bootstrap because nothing has decoded at this width
             # yet. Expected while an arena is opening and a defect if it
@@ -4119,7 +3780,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             "width_outcomes_diverged",
             "width_outcome_worst_blocks",
         ):
-            self._observe_device_gauge(subject, f"pool_{name}", int(report[name]))
+            subject.observe_device_gauge(f"pool_{name}", int(report[name]))
         # How often a row couldn't be given a page + by how much the supply fell short -- the measurement that would justify declaring a larger one.
         # Delta against this worker's own baseline: these observations are summed across jobs and the source is a running total.
         events, blocks_short = _kv_pool_shortfall_totals(device)
@@ -4147,8 +3808,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             # bound. The histogram carries the low end, in the same 64 MiB
             # buckets the reserve readings use, and needs no threshold to be
             # chosen in advance.
-            self._observe_scheduler_histogram(
-                subject, "kv_pool_tail_free_mib", pool_tail // (64 * 1024**2) * 64
+            subject.observe_scheduler_histogram("kv_pool_tail_free_mib", pool_tail // (64 * 1024**2) * 64
             )
 
     def _pool_view(
@@ -4329,25 +3989,6 @@ class ModelWorkerPool(Generic[_ModelT]):
     def _run_session_owner_free(state: SchedulerRunState) -> bool:
         return run_owner_free(state)
 
-    @staticmethod
-    def _run_owner_free(run: _PersistentRun[_ModelT]) -> bool:
-        """A resident lane holding nothing -- the only state a resize is legal in.
-
-        Same question as `run_owner_free`, read straight off the run: assembling a `SchedulerRunState` costs a device query per run per turn, and this is asked of every run every turn.
-        The two must not disagree, so here is why the shorter list is the SAME list -- five of the assembled fields are implied, and none of them is dropped by choice:
-          active <= occupied; control_intents is built from `pending_controls`;
-          producer_waits and bundle_owned_handles are both proven subsets of `resident_handles_by_key` by invariants asserted where the snapshot is built.
-        `tracked` is implied by nothing, was missing, and is the one field this predicate used to be looser by.
-        """
-        session = run.session
-        return session is not None and not (
-            session.occupied_count
-            or run.prefill_pending
-            or run.in_flight
-            or run.pending_controls
-            or run.resident_handles_by_key
-            or run.active_by_item
-        )
 
     def _run_affordable_bound(
         self,
@@ -4411,7 +4052,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         )
         # The floor is this lane's own and the pool holds it for exactly this lane, so `demand_width` can return a width the *delta* still can't buy when the device is oversubscribed.
         # Refuse to move rather than name a target legality won't honour.
-        delta = self._arena_blocks(run, target) - run.arena_blocks
+        delta = run.arena_blocks_at(target) - run.arena_blocks
         available = view.available_blocks(**self._own_credits(run))
         if delta > available:
             return run.width
@@ -4446,28 +4087,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             maximum_width=cost.maximum_width,
         )
 
-    @staticmethod
-    def _arena_bytes(run: _PersistentRun[_ModelT], width: int | None = None) -> int:
-        """What this run's arena occupies, at the width it will actually open.
 
-        `measured_row_bytes` is what a live session reported for this run's own
-        rows; it beats the analytic price whenever it is larger, because the
-        analytic price deliberately leaves the condition slots out. Taking the
-        maximum keeps a live workload from under-charging itself without ever
-        letting an unmeasured run charge less than it costs.
-        """
-        cost = run.arena_cost
-        if cost is None:
-            return 0
-        rows = run.width if width is None else width
-        return max(cost.row_bytes, run.measured_row_bytes) * max(1, rows)
-
-    def _arena_blocks(
-        self,
-        run: _PersistentRun[_ModelT],
-        width: int | None = None,
-    ) -> int:
-        return blocks_for(self._arena_bytes(run, width))
 
     def _nonresident_arena_admission_safe(
         self,
@@ -4513,7 +4133,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         # Width at the EFFECTIVE price, blocks at the RAW one, exactly as `_run_affordable_bound` and `_run_demand_width` pair them:
         # the transient is a peak a decode step reaches, not bytes the arena allocates, so it bounds how wide a lane may go and is never charged as arena.
         # This site solved the width at the raw price while the resize path solved it at the effective one -- the same lane priced two ways by two admission routes.
-        needed = self._arena_blocks(run, width)
+        needed = run.arena_blocks_at(width)
         return (
             needed
             if pool.admits(needed, **credits)
@@ -4796,15 +4416,6 @@ class ModelWorkerPool(Generic[_ModelT]):
 
     _resident_handle_key = staticmethod(resident_handle_key)
 
-    @staticmethod
-    def _task_requires_dependency_credit(task: _BatchTask[_ModelT, Any]) -> bool:
-        return bool(
-            getattr(
-                getattr(task, "item", None),
-                "requires_dependency_credit",
-                False,
-            )
-        )
 
     def _live_pool_view(self, device: str) -> PoolView:
         """A pool reading taken outside a scheduler snapshot."""
@@ -4937,12 +4548,11 @@ class ModelWorkerPool(Generic[_ModelT]):
         run.width = self._resolve_arena_width(run)
         run.capacity_resolved = True
         run.scheduler_observations["capacity_prepare_actions"] += 1
-        self._observe_lane_gauge(run, "arena_row_bytes", cost.row_bytes)
-        self._observe_lane_gauge(run, "arena_pool_width", run.width)
+        run.observe_lane_gauge("arena_row_bytes", cost.row_bytes)
+        run.observe_lane_gauge("arena_pool_width", run.width)
         # P4's verdict is NOT recorded here. Capacity preparation runs at t=0, before this lane has seen work, so a high-water read now is always its starting value
         # -- measured at 1 for a lane that went on to want 13. It goes in the per-turn histogram instead.
-        self._observe_lane_gauge(
-            run, "arena_lane_maximum_width", cost.maximum_width or 0
+        run.observe_lane_gauge("arena_lane_maximum_width", cost.maximum_width or 0
         )
         # What the arena was solved against, beside what it resolved to. A pool sized from arena demand has to know whether the width came out at the device's limit or the lane's ceiling:
         # only in the first case does "everything available" equal "no greedier than the arenas would have been". Indistinguishable from `arena_pool_width` alone => measured, not argued.
@@ -4963,9 +4573,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             if funded is not None and funded >= 1:
                 run.width = min(run.width, funded)
         # Lane-keyed although the pool belongs to the device: what this answers is what was free when THIS lane opened, and two lanes open at different moments.
-        self._observe_lane_gauge(
-            run,
-            "arena_available_blocks",
+        run.observe_lane_gauge("arena_available_blocks",
             self._live_pool_view(run.key.device).available_blocks(
                 **self._own_credits(run)
             ),
@@ -4995,17 +4603,17 @@ class ModelWorkerPool(Generic[_ModelT]):
             return None
         wanted = max(1, width, run.demand_high_water)
         role = (
-            "recovery" if "recovery" in self._run_job_types(run) else "primary"
+            "recovery" if "recovery" in run.job_types() else "primary"
         )
         declared_bytes = int(
             declare(model, wanted, run.capacity, run.key.model, role, run.key.device)
         )
-        self._observe_lane_gauge(run, "kv_pool_declared_bytes", declared_bytes)
+        run.observe_lane_gauge("kv_pool_declared_bytes", declared_bytes)
         row_bytes = _kv_lane_row_bytes(run.key.device, run.key.model)
         if row_bytes < 1:
             return None
         funded = declared_bytes // row_bytes
-        self._observe_scheduler_histogram(run, "kv_pool_funded_rows", funded)
+        run.observe_scheduler_histogram("kv_pool_funded_rows", funded)
         return funded
 
     def _resize_run_width(self, run: _PersistentRun[_ModelT], model: _ModelT) -> bool:
@@ -5042,8 +4650,8 @@ class ModelWorkerPool(Generic[_ModelT]):
             run.scheduler_observations["resize_underfunded"] += 1
             return False
         run.width_funded_ceiling = 0
-        self._refresh_capacity_measurement(run)
-        run.arena_blocks = self._arena_blocks(run)
+        run.refresh_capacity_measurement()
+        run.arena_blocks = run.arena_blocks_at()
         # The high-water resets HERE and only here -- when the width it was measured against actually changed. It's the lane's memory of its last peak; clearing it anywhere else throws that away exactly when it's needed.
         # Resetting every owner-free turn was tried and measured: owner-free is precisely when the lane just finished everything, so the reading there is its LOWEST.
         # The peak of 13 was overwritten with 0 on the turn before the resize, and every width change the run made was a narrowing -- 3 -> 1, twice, against a demand of 13.
@@ -5053,28 +4661,10 @@ class ModelWorkerPool(Generic[_ModelT]):
         run.scheduler_observations[
             "resize_grew" if target > before else "resize_narrowed"
         ] += 1
-        self._observe_scheduler_histogram(run, "resize_from_width", before)
-        self._observe_scheduler_histogram(run, "resize_to_width", target)
+        run.observe_scheduler_histogram("resize_from_width", before)
+        run.observe_scheduler_histogram("resize_to_width", target)
         return True
 
-    @staticmethod
-    def _refresh_capacity_measurement(run: _PersistentRun[_ModelT]) -> None:
-        if run.session is None:
-            run.capacity_resident_bytes = 0
-            run.capacity_graph_static_bytes = 0
-            run.capacity_total_bytes = 0
-            return
-        report = getattr(run.session, "capacity_telemetry", None)
-        if not callable(report):
-            return
-        values = dict(report())
-        run.capacity_resident_bytes = int(values.get("resident_bytes", 0))
-        run.capacity_graph_static_bytes = int(values.get("graph_static_bytes", 0))
-        run.capacity_total_bytes = int(values.get("total_bytes", 0))
-        measured = int(values.get("estimated_row_bytes", 0))
-        if measured > 0:
-            # live all-in row cost, conditions and masks included. What a later arena on this lane is sized from, and never written anywhere that outlives the process.
-            run.measured_row_bytes = measured
 
     @staticmethod
     def _preferred_actions(
@@ -5129,71 +4719,9 @@ class ModelWorkerPool(Generic[_ModelT]):
             raise RuntimeError("persistent run has no enabled action")
         return selected.kind.value
 
-    def _dependency_tier(
-        self,
-        run: _PersistentRun[_ModelT],
-        action: str,
-    ) -> tuple[int, int]:
-        """Order legal work by dependency release, then completion value."""
-        if action in {"cancel", "discard", "restore"}:
-            return 0, 0
-        if action in {"capacity_prepare", "release_admit", "resize"}:
-            return 0, 0
-        if action == "bundle_admit":
-            return 0, 0
-        if action in {"preempt_restore", "preempt_condition"}:
-            return 0, 0
-        if action == "prefill":
-            return 0, 1
-        if action == "condition_batch":
-            return 1, 1
-        # Recovery and control outrank a plain decode; removing that was tried and reverted.
-        # The suspicion was that a nearly-empty recovery lane preempts a full primary one. It does -- and removing the tier widened recovery's batches without buying any wall,
-        # because you can't batch what doesn't arrive together: a second recovery row has to come from another song, at an unrelated moment.
-        # What it did buy was longer dependency latency, which is what this tier prevents (scheduler-fill arms).
-        if self._run_job_types(run) & {"recovery", "control"}:
-            return 2, 0
-        if action == "decode":
-            return 3, 0
-        return 4, 2
 
-    @staticmethod
-    def _observe_scheduler_histogram(
-        run: _PersistentRun[_ModelT],
-        name: str,
-        value: int,
-    ) -> None:
-        run.stats.scheduler_state_histograms.setdefault(name, Counter())[int(value)] += 1
 
-    @staticmethod
-    def _observe_lane_gauge(
-        run: _PersistentRun[_ModelT],
-        name: str,
-        value: int,
-    ) -> None:
-        """A LEVEL that belongs to one lane -- a width, a price, a declaration.
 
-        Not `scheduler_observations`: that bag is SUMMED, across the lanes of a
-        run and again across the runs of an arm, and a level summed is not that
-        level. `arena_pool_width` read a stable 54 through a whole A/B because
-        one lane at 54 and two lanes at 31 + 23 are the same number (R18).
-        Keyed by lane so the gauge aggregation -- `max` per name, in
-        `run_metadata.py` -- runs per lane instead of across them.
-        """
-        run.stats.scheduler_gauges[f"{name}:{run.key.model}"] = int(value)
-
-    @staticmethod
-    def _observe_device_gauge(
-        run: _PersistentRun[_ModelT],
-        name: str,
-        value: int,
-    ) -> None:
-        """A LEVEL that belongs to the device, recorded against one run of it.
-
-        Unkeyed: every lane on the device would report the same reading, and
-        `max` is the aggregation that survives two of them doing so.
-        """
-        run.stats.scheduler_gauges[name] = int(value)
 
     def _record_scheduler_snapshot(
         self,
@@ -5218,7 +4746,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         capacity_blocked = 0
         views: dict[str, PoolView] = {}
         for run in self._persistent_runs.values():
-            condition, prefill, decode = self._run_phase_depths(run)
+            condition, prefill, decode = run.record_phase_depths()
             condition_ready += condition
             prefill_ready += prefill
             decode_ready += decode
@@ -5233,26 +4761,23 @@ class ModelWorkerPool(Generic[_ModelT]):
             # P4-3's premise, measured before anything acts on it. A width change needs every slot empty (same rule as `KVBlockPool.resize`),
             # so whether a lane must be *made* empty or is already empty often enough decides whether a drain mechanism is needed at all.
             # Per lane: the two lanes are in opposite positions and a device-wide sum hides exactly that.
-            if not self._run_owner_free(run):
+            if not run.owner_free():
                 continue
             run.scheduler_observations["resize_owner_free_turns"] += 1
             # Keyed by the width the lane held: observations are summed across jobs and a scalar can't say WHICH lane was empty.
             # One lane is empty and correctly sized, the other wrongly sized and never empty; a total that mixes them reads as "nothing to do".
-            self._observe_scheduler_histogram(
-                run, "resize_owner_free_width", run.width
+            run.observe_scheduler_histogram("resize_owner_free_width", run.width
             )
             # What the lane remembered it needed at the one moment it could act on it.
             # A target that never rises above the held width is either genuinely low demand or a high-water that isn't climbing -- opposite fixes.
-            self._observe_scheduler_histogram(
-                run, "resize_owner_free_demand", run.demand_high_water
+            run.observe_scheduler_histogram("resize_owner_free_demand", run.demand_high_water
             )
             device = run.key.device
             if device not in views:
                 views[device] = self._live_pool_view(device)
             if self._run_demand_width(run, views[device]) != run.width:
                 run.scheduler_observations["resize_opportunity_turns"] += 1
-                self._observe_scheduler_histogram(
-                    run, "resize_opportunity_width", run.width
+                run.observe_scheduler_histogram("resize_opportunity_width", run.width
                 )
 
         observations["condition_ready_job_observations"] += condition_ready
@@ -5263,9 +4788,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         # Prefill: the `PREFILL` action has zero spans because `_fill_persistent_run`'s callers drain inside their own action -- the live tripwire is `dispatch_prefill_ready`, kept.
         # Compatibility: length left the run key with the rationing it was there for, so the split it counted cannot occur.
 
-        selected_condition, selected_prefill, selected_active = self._run_phase_depths(
-            selected
-        )
+        selected_condition, selected_prefill, selected_active = selected.record_phase_depths()
         available = selected.logical_available_count
         affordable = self._run_affordable_bound(
             selected,
@@ -5321,20 +4844,9 @@ class ModelWorkerPool(Generic[_ModelT]):
                 affordable.kv_width,
             ),
         ):
-            self._observe_scheduler_histogram(selected, name, value)
+            selected.observe_scheduler_histogram(name, value)
 
-    @staticmethod
-    def _task_prefill_budget(task: _BatchTask[_ModelT, Any]) -> int:
-        if getattr(task.item, "resident_handle", None) is not None:
-            return 0
-        return int(getattr(task.item, "prefill_token_budget", 384))
 
-    @staticmethod
-    def _task_decode_budget(task: _BatchTask[_ModelT, Any]) -> int:
-        handle = getattr(task.item, "resident_handle", None)
-        if handle is not None:
-            return int(getattr(handle, "remaining_token_budget", 2048))
-        return int(getattr(task.item, "remaining_decode_token_budget", 2048))
 
     def _persistent_run_score(
         self,
@@ -5346,14 +4858,14 @@ class ModelWorkerPool(Generic[_ModelT]):
         action_name = (
             self._preferred_run_action(run) if action is None else action.kind.value
         )
-        dependency_tier = self._dependency_tier(run, action_name)
+        dependency_tier = run.dependency_tier(action_name)
         if force_decode and action_name == "decode":
             dependency_tier = (1, 0)
         active = run.session.active_count if run.session is not None else 0
         available = self._admittable_count(run)
         admitted = min(len(run.pending), available)
         projected_width = active + admitted
-        pending = self._ordered_pending(run)[:admitted]
+        pending = run.ordered_pending()[:admitted]
         decode_budget = (
             int(
                 getattr(
@@ -5364,13 +4876,13 @@ class ModelWorkerPool(Generic[_ModelT]):
             )
             if run.session is not None
             else 0
-        ) + sum(self._task_decode_budget(task) for task in pending)
+        ) + sum(task_decode_budget(task) for task in pending)
         completion_budget = (
             (decode_budget + projected_width - 1) // projected_width
             if projected_width
             else 0
         )
-        prefill_budget = sum(self._task_prefill_budget(task) for task in pending)
+        prefill_budget = sum(task_prefill_budget(task) for task in pending)
         age_bonus = min(run.width, run.age // 4)
         oldest = pending[0].ready_order if pending else ""
         condition_batch_width = (
@@ -5394,7 +4906,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         if action_name == "prefill":
             action_cost = float(
                 sum(
-                    self._task_prefill_budget(task)
+                    task_prefill_budget(task)
                     for batch in run.prefill_pending
                     for task, _prepared in batch.selected
                 )
@@ -5418,7 +4930,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             effective_width = max(1, active)
         efficiency_cost = action_cost / effective_width
         recovery_credit = (
-            2.0 if "recovery" in self._run_job_types(run) else 0.0
+            2.0 if "recovery" in run.job_types() else 0.0
         )
         aging_credit = min(256.0, run.age * 8.0)
         starvation_bound_reached = run.age >= 16
@@ -5434,66 +4946,15 @@ class ModelWorkerPool(Generic[_ModelT]):
             efficiency_cost - recovery_credit - aging_credit,
             completion_budget,
             -(projected_width + age_bonus),
-            "recovery" if "recovery" in self._run_job_types(run) else "primary",
+            "recovery" if "recovery" in run.job_types() else "primary",
             efficiency_cost,
             prefill_budget,
             oldest,
             run.capacity,
         )
 
-    @staticmethod
-    def _drain_phase_gpu_ms(
-        run: _PersistentRun[_ModelT],
-        session: _ResumableSession,
-    ) -> None:
-        """Accumulate completed CUDA Event timings for this run's record.
 
-        Reporting only. The learned phase-cost curve these used to feed was
-        deleted with the rest of the prediction surface; the timings remain
-        because the run record and the waterfall are read by people.
-        """
-        drain = getattr(session, "drain_phase_gpu_ms", None)
-        phase_timings = {} if drain is None else dict(drain())
-        drain_capture = getattr(session, "drain_cuda_graph_capture_gpu_ms", None)
-        if drain_capture is not None:
-            capture_ms = float(drain_capture())
-            if capture_ms:
-                phase_timings["graph_capture"] = capture_ms
-        for phase, milliseconds in phase_timings.items():
-            run.stats.phase_gpu_ms[phase] = run.stats.phase_gpu_ms.get(phase, 0.0) + float(
-                milliseconds
-            )
 
-    def _admit_conditioned_batch(self, run: _PersistentRun[_ModelT]) -> None:
-        """Move one condition-ready cohort into the session's KV-prefill phase."""
-        if run.session is None:
-            raise RuntimeError("condition-ready rows require a persistent session")
-        queued = run.prefill_pending.pop(0)
-        admit = getattr(run.session, "admit_conditioned_many", None)
-        if not callable(admit):
-            raise RuntimeError("phase-queue session lacks conditioned admission")
-        if not admit(queued.conditioned):
-            raise RuntimeError("condition-ready cohort could not be admitted")
-        if run.quantum_count:
-            run.stats.hot_replacements += len(queued.selected)
-        for task, prepared_item in queued.selected:
-            run.active_by_item[id(prepared_item.session_item)] = (task, prepared_item)
-
-    @staticmethod
-    def _persistent_session_owner_free(run: _PersistentRun[_ModelT]) -> bool:
-        session = run.session
-        return session is not None and not any(
-            (
-                run.pending_controls,
-                run.prefill_pending,
-                run.in_flight,
-                run.active_by_item,
-                run.resident_handles_by_key,
-                session.active_count,
-                session.occupied_count,
-                int(getattr(session, "displaced_count", 0)),
-            )
-        )
 
     def _reject_cancelled_dependency_owner(
         self,
@@ -5518,21 +4979,21 @@ class ModelWorkerPool(Generic[_ModelT]):
         )
 
     def _release_idle_session(self, run: _PersistentRun[_ModelT]) -> None:
-        if not self._persistent_session_owner_free(run):
+        if not run.releasable():
             raise SchedulerInvariantError(
                 "reclaim donor retained continuous-session ownership"
             )
         session = run.session
         assert session is not None
         started_at = time.perf_counter()
-        slots_before = self._waterfall_slots(run)
-        self._collect_preemption_telemetry(run)
+        slots_before = run.waterfall_slots()
+        run.collect_preemption_telemetry()
         close = getattr(session, "close", None)
         if callable(close):
             close()
         run.session = None
         run.quantum_count = 0
-        self._refresh_capacity_measurement(run)
+        run.refresh_capacity_measurement()
         run.scheduler_observations["session_release_actions"] += 1
         self._record_waterfall_event(
             run,
@@ -5585,7 +5046,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         if len(target.pending) >= pending_before:
             raise SchedulerInvariantError("reclaim admission consumed no pending row")
         if deferred_prefill:
-            self._admit_conditioned_batch(target)
+            target.admit_conditioned_batch()
         target.model_loaded = target.model_loaded or loaded
         target.scheduler_observations["release_admit_actions"] += 1
         return loaded, model_started, model_finished
@@ -5647,7 +5108,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             if run.quantum_count and run.session.occupied_count:
                 return False
             if not run.session.occupied_count:
-                self._collect_preemption_telemetry(run)
+                run.collect_preemption_telemetry()
                 run.session = None
                 run.quantum_count = 0
         prefill_budget = 4096
@@ -5658,7 +5119,7 @@ class ModelWorkerPool(Generic[_ModelT]):
         if (
             run.session is None
             and run.pending
-            and self._task_requires_dependency_credit(run.pending[0])
+            and task_requires_dependency_credit(run.pending[0])
         ):
             # Establish one measured session row before crediting its peers.
             available = min(available, 1)
@@ -5679,7 +5140,7 @@ class ModelWorkerPool(Generic[_ModelT]):
             pending_index = (
                 None
                 if not eligible
-                else min(eligible, key=lambda pair: self._task_schedule_key(pair[1]))[0]
+                else min(eligible, key=lambda pair: task_schedule_key(pair[1]))[0]
             )
             if pending_index is not None:
                 task = run.pending[pending_index]
@@ -5701,10 +5162,10 @@ class ModelWorkerPool(Generic[_ModelT]):
                     task, borrowed_from = borrowed
             if require_equal_prompt and cohort_dimension is None:
                 cohort_dimension = task.batch_dimension
-            task_prefill = self._task_prefill_budget(task)
+            task_prefill = task_prefill_budget(task)
             if prefill_budget < task_prefill and run.session is not None:
                 if borrowed_from is not None:
-                    self._return_borrowed_task(task, borrowed_from)
+                    borrowed_from.take_back(task)
                 break
             if borrowed_from is None:
                 assert pending_index is not None
@@ -5749,9 +5210,8 @@ class ModelWorkerPool(Generic[_ModelT]):
             # and opening narrow with no resize driver built would strand it
             # there -- the same failure the other way round. So the two numbers
             # are recorded side by side first, and the second is not used.
-            self._observe_scheduler_histogram(run, "arena_open_width", run.width)
-            self._observe_scheduler_histogram(
-                run, "arena_open_demand_width", self._run_demand_width(run)
+            run.observe_scheduler_histogram("arena_open_width", run.width)
+            run.observe_scheduler_histogram("arena_open_demand_width", self._run_demand_width(run)
             )
             run.session = run.factory(
                 model,
@@ -5759,8 +5219,8 @@ class ModelWorkerPool(Generic[_ModelT]):
                 run.width,
                 run.capacity,
             )
-            self._refresh_capacity_measurement(run)
-            run.arena_blocks = self._arena_blocks(run)
+            run.refresh_capacity_measurement()
+            run.arena_blocks = run.arena_blocks_at()
             drain_init_spans = getattr(run.session, "drain_init_wall_spans", None)
             if callable(drain_init_spans) and self._observer.trace_spans:
                 for phase, started_at, finished_at in drain_init_spans():
@@ -5769,10 +5229,10 @@ class ModelWorkerPool(Generic[_ModelT]):
                         started_at,
                         finished_at,
                         resource="gpu",
-                        lane=f"{self._session_label(run)} init",
+                        lane=f"{run.session_label()} init",
                         model=run.key.model,
                         session_id=run.session.session_id,
-                        session_label=self._session_label(run),
+                        session_label=run.session_label(),
                     )
             replacement_start = len(session_items)
         replacements = session_items[replacement_start:]
@@ -5883,13 +5343,6 @@ class ModelWorkerPool(Generic[_ModelT]):
         )
         return donor.pending.pop(0), donor
 
-    @staticmethod
-    def _return_borrowed_task(
-        task: _BatchTask[_ModelT, Any],
-        donor: _PersistentRun[_ModelT],
-    ) -> None:
-        donor.pending.append(task)
-        donor.pending.sort(key=lambda candidate: candidate.sequence)
 
     def _record_persistent_timing(
         self,
@@ -5959,8 +5412,8 @@ class ModelWorkerPool(Generic[_ModelT]):
             ),
             bucket_borrows=run.stats.borrowed_admissions if report_stats else 0,
             ready_order=task.ready_order,
-            estimated_prefill_tokens=self._task_prefill_budget(task),
-            estimated_decode_tokens=self._task_decode_budget(task),
+            estimated_prefill_tokens=task_prefill_budget(task),
+            estimated_decode_tokens=task_decode_budget(task),
             active_steps_by_width=(
                 dict(run.stats.active_steps_by_width) if report_stats else {}
             ),
@@ -6165,7 +5618,7 @@ class ModelWorkerPool(Generic[_ModelT]):
                             "terminal_handle_release_failures"
                         ] += 1
         run.resident_handles_by_key.clear()
-        self._collect_preemption_telemetry(run)
+        run.collect_preemption_telemetry()
         run.session = None
         run.pending.clear()
         run.in_flight.clear()
