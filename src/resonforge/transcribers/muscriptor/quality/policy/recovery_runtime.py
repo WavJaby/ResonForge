@@ -92,6 +92,46 @@ if TYPE_CHECKING:
 
 _SAMPLE_RATE = 16000
 _SEGMENT_DURATION = 5.0
+_SEGMENT_SAMPLES = int(_SEGMENT_DURATION * _SAMPLE_RATE)
+
+# (condition, condition origin, ownership start); origin == owner on the fixed grid, origin < owner only for a reflowed head that reaches one overlap backward.
+_ScheduleEntry = tuple[ConditioningAttributes | None, float, float]
+
+
+def _condition_at(
+    model: ModelProtocol,
+    wav: torch.Tensor,
+    origin_seconds: float,
+    instrument_group: str,
+) -> ConditioningAttributes:
+    """Condition one segment window at `origin_seconds`, zero-padded past the audio end."""
+    start = round(origin_seconds * _SAMPLE_RATE)
+    chunk = wav[:, start : start + _SEGMENT_SAMPLES]
+    if chunk.shape[-1] < _SEGMENT_SAMPLES:
+        chunk = F.pad(chunk, (0, _SEGMENT_SAMPLES - chunk.shape[-1]))
+    return model._build_conditions(chunk, instrument_group)[0]
+
+
+def _reflow_schedule(
+    schedule: list[_ScheduleEntry],
+    chunk_index: int,
+    *,
+    grid_from: float,
+    audio_duration: float,
+    stride: float,
+    head: _ScheduleEntry | None = None,
+) -> float | None:
+    """Replace everything after `chunk_index` with `head` (if any) + a fixed grid from `grid_from + stride`; returns the new next seek.
+
+    The two callers differ only in the head: an overlap-extended chunk re-grids from its own origin, a recovery reflow seeds one entry whose owner is the winner's end.
+    """
+    replacement: list[_ScheduleEntry] = [head] if head is not None else []
+    origin = grid_from + stride
+    while origin < audio_duration:
+        replacement.append((None, origin, origin))
+        origin += stride
+    schedule[chunk_index + 1 :] = replacement
+    return replacement[0][2] if replacement else None
 
 
 @dataclass
@@ -446,18 +486,7 @@ def _recover_chunk(
     if recovery_enabled and trigger_reason is not None:
         seed = derive_recovery_seed(recovery_seed, chunk_index, 0)
         shifted_seek = max(0.0, seek - recovery_shift_seconds)
-        shifted_start = round(shifted_seek * _SAMPLE_RATE)
-        segment_samples = int(_SEGMENT_DURATION * _SAMPLE_RATE)
-        shifted_chunk = wav[:, shifted_start : shifted_start + segment_samples]
-        if shifted_chunk.shape[-1] < segment_samples:
-            shifted_chunk = F.pad(
-                shifted_chunk,
-                (0, segment_samples - shifted_chunk.shape[-1]),
-            )
-        shifted_condition = model._build_conditions(
-            shifted_chunk,
-            instrument_group,
-        )[0]
+        shifted_condition = _condition_at(model, wav, shifted_seek, instrument_group)
         shifted_open = overlap_runtime.open_keys_at(
             model._tokenizer,
             previous_tokens,
@@ -1497,16 +1526,13 @@ def forcing_stream(
     stride = seek_times[1] - seek_times[0] if total > 1 else _SEGMENT_DURATION
     # condition_origin and ownership_start normally coincide. A reflow chunk is
     # the sole exception: its condition starts one overlap before ownership.
-    schedule: list[tuple[ConditioningAttributes | None, float, float]] = [
-        (None, seek, seek) for seek in seek_times
-    ]
+    schedule: list[_ScheduleEntry] = [(None, seek, seek) for seek in seek_times]
     if all_conditions is not None:
         schedule = [
             (condition, seek, seek)
             for condition, seek in zip(all_conditions, seek_times, strict=True)
         ]
     chunk_index = 0
-    segment_samples = int(_SEGMENT_DURATION * _SAMPLE_RATE)
     progress_completed = 0
     while chunk_index < len(schedule):
         condition, condition_origin, ownership_start = schedule[chunk_index]
@@ -1547,27 +1573,20 @@ def forcing_stream(
                 if abs(desired_origin - condition_origin) > 1e-9:
                     condition_origin = desired_origin
                     condition = None
-                    replacement: list[
-                        tuple[ConditioningAttributes | None, float, float]
-                    ] = []
-                    owner = condition_origin + stride
-                    while owner < audio_duration:
-                        replacement.append((None, owner, owner))
-                        owner += stride
-                    schedule[chunk_index + 1 :] = replacement
-                    next_seek = replacement[0][2] if replacement else None
+                    next_seek = _reflow_schedule(
+                        schedule,
+                        chunk_index,
+                        grid_from=condition_origin,
+                        audio_duration=audio_duration,
+                        stride=stride,
+                    )
                     boundary = ChunkBoundary(ownership_start, next_seek)
 
         tracker.feed(boundary)
 
         seek = condition_origin
         if condition is None:
-            segment_samples = int(_SEGMENT_DURATION * _SAMPLE_RATE)
-            start = round(condition_origin * _SAMPLE_RATE)
-            chunk = wav[:, start : start + segment_samples]
-            if chunk.shape[-1] < segment_samples:
-                chunk = F.pad(chunk, (0, segment_samples - chunk.shape[-1]))
-            condition = model._build_conditions(chunk, instrument_group)[0]
+            condition = _condition_at(model, wav, condition_origin, instrument_group)
 
         prompt_plan = overlap_runtime.PromptPlan((), 0, 0, 0, 0)
         prompt_ids: list[int] = []
@@ -2062,15 +2081,14 @@ def forcing_stream(
             )
             first_owner = selected_reference_end
             first_origin = max(0.0, first_owner - overlap_seconds)
-            replacement: list[tuple[ConditioningAttributes | None, float, float]] = [
-                (None, first_origin, first_owner)
-            ]
-            origin = first_origin + stride
-            while origin < audio_duration:
-                replacement.append((None, origin, origin))
-                origin += stride
-            schedule[chunk_index + 1 :] = replacement
-            next_seek = first_owner
+            next_seek = _reflow_schedule(
+                schedule,
+                chunk_index,
+                grid_from=first_origin,
+                audio_duration=audio_duration,
+                stride=stride,
+                head=(None, first_origin, first_owner),
+            )
             boundary = ChunkBoundary(ownership_start, next_seek)
             (stderr_logger or logging.getLogger("muscriptor.stderr")).info(
                 "[muscriptor] recovery reflow: next condition %.2f-%.2fs; "
