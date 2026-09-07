@@ -831,6 +831,107 @@ def _verify_at_checkpoint(
     return candidate_states
 
 
+@dataclass(frozen=True)
+class _SafeFrontier:
+    """The longest clean prefix of a failed attempt, kept as this chunk's output. `time` is where ownership ends; it is also the reference end."""
+
+    source: str
+    time: float
+    reference_tokens: list[int]
+    reference_origin: float
+    tokens: list[int]
+
+
+def _safe_frontier(
+    stem: _StemContext,
+    chunk: _ChunkContext,
+    *,
+    primary_diagnostic: RecoveryCandidateDiagnostics,
+    chunk_tokens: list[int],
+    candidate_states: dict[str, _VerificationCandidateState],
+    candidate_names: list[str],
+    checkpoint_selected_name: str | None,
+) -> _SafeFrontier | None:
+    """When no attempt is reference-eligible, the first attempt in preference order whose safe frontier reaches past the verification window.
+
+    Pure. `primary_diagnostic` and `chunk_tokens` are the values AFTER any primary continuation, not `primary`'s, which is why they are passed and not read off the context."""
+    model = stem.model
+    recovery_selection = stem.recovery_selection
+    audio_duration = stem.audio_duration
+    ownership_start = chunk.ownership_start
+    seek = chunk.seek
+    next_seek = chunk.next_seek
+    verification_end = chunk.verification_end
+    prompt_ids = chunk.prompt_ids
+
+    frontier_names = (
+        # Every completed attempt is frontier material, the winner
+        # first -- a fallback that also failed may still hold a
+        # longer clean prefix than the winner's.
+        list(
+            dict.fromkeys(
+                [checkpoint_selected_name, *candidate_names]
+            )
+        )
+        if recovery_selection == "checkpoint"
+        else list(candidate_names)
+    )
+    for frontier_name in frontier_names:
+        if frontier_name == "primary":
+            frontier_diagnostic = primary_diagnostic
+            frontier_tokens = chunk_tokens
+            frontier_prompt_length = len(prompt_ids)
+            frontier_origin = seek
+        elif frontier_name in candidate_states:
+            frontier_state = candidate_states[frontier_name]
+            frontier_diagnostic = frontier_state.diagnostic
+            frontier_tokens = frontier_state.tokens
+            frontier_prompt_length = frontier_state.prompt_length
+            frontier_origin = frontier_state.origin
+        else:
+            continue
+        frontier = candidate_safe_frontier(frontier_diagnostic)
+        if frontier is None or frontier.shift_value is None:
+            continue
+        candidate_frontier_time = (
+            frontier_origin
+            + frontier.shift_value / model._tokenizer.frame_rate
+        )
+        candidate_end = min(
+            next_seek or audio_duration,
+            frontier_origin + _SEGMENT_DURATION,
+            audio_duration,
+        )
+        if (
+            candidate_frontier_time <= ownership_start + 1e-9
+            or candidate_frontier_time < verification_end - 1e-9
+        ):
+            continue
+        safe_frontier_time = min(
+            candidate_frontier_time,
+            candidate_end,
+        )
+        prefix_end = min(
+            len(frontier_tokens),
+            frontier_prompt_length + frontier.token_index + 1,
+        )
+        reference_tokens = frontier_tokens[:prefix_end]
+        return _SafeFrontier(
+            source=frontier_diagnostic.name,
+            time=safe_frontier_time,
+            reference_tokens=reference_tokens,
+            reference_origin=frontier_origin,
+            tokens=overlap_runtime.canonicalize_tokens(
+                model._tokenizer,
+                reference_tokens,
+                frontier_origin,
+                ownership_start,
+                safe_frontier_time,
+            ),
+        )
+    return None
+
+
 def _recover_chunk(
     stem: _StemContext,
     config: _RecoveryConfig,
@@ -1213,76 +1314,29 @@ def _recover_chunk(
         }.get(selected_name, "fresh_reanchor_required")
 
         if selected_name is None:
-            frontier_names = (
-                # Every completed attempt is frontier material, the winner
-                # first -- a fallback that also failed may still hold a
-                # longer clean prefix than the winner's.
-                list(
-                    dict.fromkeys(
-                        [checkpoint_selected_name, *candidate_names]
-                    )
-                )
-                if recovery_selection == "checkpoint"
-                else list(candidate_names)
+            frontier = _safe_frontier(
+                stem,
+                chunk,
+                primary_diagnostic=primary_diagnostic,
+                chunk_tokens=chunk_tokens,
+                candidate_states=candidate_states,
+                candidate_names=candidate_names,
+                checkpoint_selected_name=checkpoint_selected_name,
             )
-            for frontier_name in frontier_names:
-                if frontier_name == "primary":
-                    frontier_diagnostic = primary_diagnostic
-                    frontier_tokens = chunk_tokens
-                    frontier_prompt_length = len(prompt_ids)
-                    frontier_origin = seek
-                elif frontier_name in candidate_states:
-                    frontier_state = candidate_states[frontier_name]
-                    frontier_diagnostic = frontier_state.diagnostic
-                    frontier_tokens = frontier_state.tokens
-                    frontier_prompt_length = frontier_state.prompt_length
-                    frontier_origin = frontier_state.origin
-                else:
-                    continue
-                frontier = candidate_safe_frontier(frontier_diagnostic)
-                if frontier is None or frontier.shift_value is None:
-                    continue
-                candidate_frontier_time = (
-                    frontier_origin
-                    + frontier.shift_value / model._tokenizer.frame_rate
-                )
-                candidate_end = min(
-                    next_seek or audio_duration,
-                    frontier_origin + _SEGMENT_DURATION,
-                    audio_duration,
-                )
-                if (
-                    candidate_frontier_time <= ownership_start + 1e-9
-                    or candidate_frontier_time < verification_end - 1e-9
-                ):
-                    continue
-                safe_frontier_time = min(
-                    candidate_frontier_time,
-                    candidate_end,
-                )
-                prefix_end = min(
-                    len(frontier_tokens),
-                    frontier_prompt_length + frontier.token_index + 1,
-                )
-                selected_reference_tokens = frontier_tokens[:prefix_end]
-                selected_reference_origin = frontier_origin
-                selected_reference_end = safe_frontier_time
-                selected_tokens = overlap_runtime.canonicalize_tokens(
-                    model._tokenizer,
-                    selected_reference_tokens,
-                    selected_reference_origin,
-                    ownership_start,
-                    safe_frontier_time,
-                )
+            if frontier is not None:
+                safe_frontier_time = frontier.time
+                selected_reference_tokens = frontier.reference_tokens
+                selected_reference_origin = frontier.reference_origin
+                selected_reference_end = frontier.time
+                selected_tokens = frontier.tokens
                 selected_name = "safe_frontier"
                 selection_reason = "safe_frontier_prefix_retained"
-                safe_frontier_source = frontier_diagnostic.name
+                safe_frontier_source = frontier.source
                 force_reflow = (
                     safe_frontier_time < audio_duration - 1e-9
                 )
                 ended = True
                 accepted_chunk_quality = None
-                break
 
         fresh: _FreshReanchor | None = None
         # Disabling fresh re-anchor makes this chunk a discard instead.
