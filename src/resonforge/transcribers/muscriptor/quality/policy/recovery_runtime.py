@@ -1025,6 +1025,281 @@ def _resume_primary(
     )
 
 
+def _attempt_candidates(
+    stem: _StemContext,
+    chunk: _ChunkContext,
+    *,
+    candidate_states: dict[str, _VerificationCandidateState],
+    checkpoint_selected_name: str | None,
+    primary_diagnostic: RecoveryCandidateDiagnostics,
+    secondary_name: str,
+) -> Iterator[object]:
+    """Resume the candidates in preference order until one survives as a completed chunk.
+
+    Mutates `candidate_states` in place (tokens, handle, diagnostic, `chunk_quality_safe`). Returns `(attempted_names, candidate_names)`: the second is attempt order, which is preference order by construction, and the selection stage reads it as such."""
+    model = stem.model
+    recovery_selection = stem.recovery_selection
+    chunk_quality_history = stem.chunk_quality_history
+    audio_duration = stem.audio_duration
+    recovery_quality_guard = stem.recovery_quality_guard
+    ownership_start = chunk.ownership_start
+    next_seek = chunk.next_seek
+
+    attempted_names: set[str] = set()
+
+    def _fallback_candidates(
+        *,
+        # Bound at def time, re-bound each chunk iteration -- the
+        # closure-over-loop-variable hazard (B023) made explicit.
+        _states=candidate_states,
+        _attempted=attempted_names,
+        _secondary=secondary_name,
+    ) -> list[str]:
+        """Unattempted candidates still standing, best score first.
+
+        Checkpoint diagnostics only: an attempted candidate's
+        diagnostic has been replaced by its (failed) completed one, so
+        it can never re-enter."""
+        return sorted(
+            (
+                name
+                for name in ("shifted_replay", _secondary)
+                if name not in _attempted
+                and _states[name].diagnostic.structural_valid
+                and _states[name].diagnostic.reference_eligible
+                and _states[name].diagnostic
+                .verification_match.score is not None
+            ),
+            key=lambda name: _states[name]
+            .diagnostic.verification_match.score,
+            reverse=True,
+        )
+
+    if recovery_selection == "checkpoint":
+        if checkpoint_selected_name in candidate_states:
+            candidate_names = [checkpoint_selected_name]
+        elif checkpoint_selected_name == "primary" and not (
+            primary_diagnostic.structural_valid
+            and primary_diagnostic.reference_eligible
+        ):
+            # The winner's own continuation failed; the losers are
+            # still paused at their checkpoints.
+            candidate_names = _fallback_candidates()[:1]
+        else:
+            candidate_names = []
+    else:
+        candidate_names = [secondary_name]
+    for name in candidate_names:
+        checkpoint_candidate = candidate_states[name].diagnostic
+        if not checkpoint_candidate.structural_valid:
+            continue
+        attempted_names.add(name)
+        state = candidate_states[name]
+        if state.handle is not None:
+            continuation = yield from _resume_resident_generation(
+                state.handle
+            )
+            state.tokens = list(continuation.tokens)
+            state.ended = continuation.emitted_eos
+            state.handle = continuation.resident_handle
+            state.abort_reason = (
+                _critical_guard_reason(continuation.guard_findings)
+                or state.abort_reason
+            )
+            state.guard_summary = (
+                continuation.guard_summary or state.guard_summary
+            )
+            state.guard_findings = continuation.guard_findings
+        final_diagnostic = evaluate_candidate(
+            name,
+            state.tokens,
+            state.prompt_length,
+            state.ended,
+            model._tokenizer._vocab,
+            verification_match=checkpoint_candidate.verification_match,
+            forced_invalid_reason=state.abort_reason,
+            model_name=checkpoint_candidate.model_name,
+            sampling=checkpoint_candidate.sampling,
+            condition_seek_time=checkpoint_candidate.condition_seek_time,
+            guard_findings=state.guard_findings,
+        )
+        if final_diagnostic.structural_valid:
+            candidate_quality_end = min(
+                next_seek or audio_duration,
+                state.origin + _SEGMENT_DURATION,
+                audio_duration,
+            )
+            (
+                candidate_quality,
+                candidate_action,
+                candidate_findings,
+                candidate_assessment,
+            ) = _evaluate_chunk_quality(
+                model._tokenizer,
+                state.tokens,
+                state.origin,
+                ownership_start,
+                candidate_quality_end,
+                max(0, len(state.tokens) - state.prompt_length),
+                recovery_quality_guard,
+                chunk_quality_history.reference(),
+                state.guard_summary,
+            )
+            semantic_reason = (
+                _critical_guard_reason(candidate_findings)
+                if candidate_action == "reject_candidate"
+                else None
+            )
+            state.chunk_quality_safe = (
+                _critical_guard_reason(candidate_findings) is None
+            )
+            final_diagnostic = evaluate_candidate(
+                name,
+                state.tokens,
+                state.prompt_length,
+                state.ended,
+                model._tokenizer._vocab,
+                verification_match=(
+                    checkpoint_candidate.verification_match
+                ),
+                forced_invalid_reason=semantic_reason,
+                model_name=checkpoint_candidate.model_name,
+                sampling=checkpoint_candidate.sampling,
+                condition_seek_time=(
+                    checkpoint_candidate.condition_seek_time
+                ),
+                chunk_quality=candidate_quality,
+                chunk_guard_reasons=tuple(
+                    finding.reason for finding in candidate_findings
+                ),
+                guard_findings=(
+                    *state.guard_findings,
+                    *candidate_findings,
+                ),
+                chunk_quality_reference_samples=len(
+                    chunk_quality_history.reference().samples
+                ),
+                chunk_quality_assessment=candidate_assessment,
+            )
+        state.diagnostic = final_diagnostic
+        state.chunk_quality_safe = (
+            final_diagnostic.structural_valid
+            and final_diagnostic.reference_eligible
+        )
+        if (
+            recovery_selection == "completed_quality"
+            and name == secondary_name
+            and not state.chunk_quality_safe
+        ):
+            candidate_names.append("shifted_replay")
+        if (
+            recovery_selection == "checkpoint"
+            and not state.chunk_quality_safe
+        ):
+            # Same shape as the completed-quality clause above: the
+            # attempted candidate's completed chunk failed, the next
+            # eligible one is still paused at its checkpoint -- try it
+            # before settling for a frontier prefix or a discard.
+            candidate_names.extend(_fallback_candidates()[:1])
+    return attempted_names, candidate_names
+
+
+def _discard_losers(
+    stem: _StemContext,
+    *,
+    candidate_states: dict[str, _VerificationCandidateState],
+    attempted_names: set[str],
+    secondary_name: str,
+    primary: _PrimaryOutcome,
+) -> Iterator[object]:
+    """Release every paused row still held and close the primary generation. Mutates `candidate_states`; a candidate never resumed after its checkpoint is marked so."""
+    model = stem.model
+    primary_handle = primary.primary_handle
+    primary_generation = primary.primary_generation
+
+    for name in ("shifted_replay", secondary_name):
+        state = candidate_states[name]
+        if state.handle is not None:
+            yield from _discard_resident_generation(state.handle)
+            state.handle = None
+        if (
+            name not in attempted_names
+            and state.reached_checkpoint
+            and state.abort_reason is None
+        ):
+            checkpoint = state.diagnostic
+            state.diagnostic = evaluate_candidate(
+                name,
+                state.evaluation_tokens,
+                state.prompt_length,
+                False,
+                model._tokenizer._vocab,
+                verification_match=checkpoint.verification_match,
+                forced_invalid_reason="not_resumed_after_checkpoint",
+                model_name=checkpoint.model_name,
+                sampling=checkpoint.sampling,
+                condition_seek_time=checkpoint.condition_seek_time,
+            )
+    if primary_handle is not None:
+        yield from _discard_resident_generation(primary_handle)
+    primary_generation.close()
+
+
+def _select_candidate(
+    stem: _StemContext,
+    *,
+    candidate_states: dict[str, _VerificationCandidateState],
+    secondary_name: str,
+    checkpoint_selected_name: str | None,
+    attempted_names: set[str],
+    candidate_names: list[str],
+    primary_diagnostic: RecoveryCandidateDiagnostics,
+) -> tuple[list[RecoveryCandidateDiagnostics], str | None, str]:
+    """Pick the chunk's owner among the completed attempts. Pure. Returns `(candidate_diagnostics, selected_name, selection_reason)`; a None name means no attempt is reference-eligible and the frontier / fresh stages follow."""
+    recovery_selection = stem.recovery_selection
+
+    candidate_diagnostics = [
+        primary_diagnostic,
+        candidate_states["shifted_replay"].diagnostic,
+        candidate_states[secondary_name].diagnostic,
+    ]
+    if recovery_selection == "checkpoint":
+        # The winner when its completed chunk survived; otherwise the
+        # first fallback whose did. `candidate_names` is attempt order,
+        # which is preference order by construction.
+        if (
+            checkpoint_selected_name == "primary"
+            and primary_diagnostic.structural_valid
+            and primary_diagnostic.reference_eligible
+        ):
+            selected_name = "primary"
+        else:
+            selected_name = next(
+                (
+                    name
+                    for name in candidate_names
+                    if name in attempted_names
+                    and candidate_states[name].diagnostic.structural_valid
+                    and candidate_states[name].diagnostic.reference_eligible
+                ),
+                None,
+            )
+    else:
+        recovery_order = recovery_candidate_order(
+            primary_diagnostic,
+            candidate_states["shifted_replay"].diagnostic,
+            candidate_states[secondary_name].diagnostic,
+        )
+        selected_name = recovery_order[0].name if recovery_order else None
+    selection_reason = {
+        "secondary_model": "secondary_recovery_reference_eligible",
+        "new_seed": "secondary_recovery_reference_eligible",
+        "shifted_replay": "shifted_replay_reference_eligible",
+        "primary": "primary_reference_eligible",
+    }.get(selected_name, "fresh_reanchor_required")
+    return candidate_diagnostics, selected_name, selection_reason
+
+
 def _recovery_disabled(
     stem: _StemContext,
     config: _RecoveryConfig,
@@ -1134,10 +1409,8 @@ def _recover_chunk(
     model = stem.model
     wav = stem.wav
     recovery_selection = stem.recovery_selection
-    chunk_quality_history = stem.chunk_quality_history
     recovery_enabled = stem.recovery_enabled
     audio_duration = stem.audio_duration
-    recovery_quality_guard = stem.recovery_quality_guard
     recovery_seed = config.recovery_seed
     fresh_reanchor = config.fresh_reanchor
     overlap_probe_enabled = config.overlap_probe_enabled
@@ -1151,7 +1424,6 @@ def _recover_chunk(
     verification_end = chunk.verification_end
     verification_end_shift = chunk.verification_end_shift
     prompt_ids = chunk.prompt_ids
-    primary_generation = primary.primary_generation
     primary_handle = primary.primary_handle
     primary_diagnostic = primary.primary_diagnostic
     primary_match = primary.primary_match
@@ -1222,230 +1494,30 @@ def _recover_chunk(
             primary_chunk_action = outcome.primary_chunk_action
             primary_chunk_findings = outcome.primary_chunk_findings
             primary_chunk_assessment = outcome.primary_chunk_assessment
-        attempted_names: set[str] = set()
-
-        def _fallback_candidates(
-            *,
-            # Bound at def time, re-bound each chunk iteration -- the
-            # closure-over-loop-variable hazard (B023) made explicit.
-            _states=candidate_states,
-            _attempted=attempted_names,
-            _secondary=secondary_name,
-        ) -> list[str]:
-            """Unattempted candidates still standing, best score first.
-
-            Checkpoint diagnostics only: an attempted candidate's
-            diagnostic has been replaced by its (failed) completed one, so
-            it can never re-enter."""
-            return sorted(
-                (
-                    name
-                    for name in ("shifted_replay", _secondary)
-                    if name not in _attempted
-                    and _states[name].diagnostic.structural_valid
-                    and _states[name].diagnostic.reference_eligible
-                    and _states[name].diagnostic
-                    .verification_match.score is not None
-                ),
-                key=lambda name: _states[name]
-                .diagnostic.verification_match.score,
-                reverse=True,
-            )
-
-        if recovery_selection == "checkpoint":
-            if checkpoint_selected_name in candidate_states:
-                candidate_names = [checkpoint_selected_name]
-            elif checkpoint_selected_name == "primary" and not (
-                primary_diagnostic.structural_valid
-                and primary_diagnostic.reference_eligible
-            ):
-                # The winner's own continuation failed; the losers are
-                # still paused at their checkpoints.
-                candidate_names = _fallback_candidates()[:1]
-            else:
-                candidate_names = []
-        else:
-            candidate_names = [secondary_name]
-        for name in candidate_names:
-            checkpoint_candidate = candidate_states[name].diagnostic
-            if not checkpoint_candidate.structural_valid:
-                continue
-            attempted_names.add(name)
-            state = candidate_states[name]
-            if state.handle is not None:
-                continuation = yield from _resume_resident_generation(
-                    state.handle
-                )
-                state.tokens = list(continuation.tokens)
-                state.ended = continuation.emitted_eos
-                state.handle = continuation.resident_handle
-                state.abort_reason = (
-                    _critical_guard_reason(continuation.guard_findings)
-                    or state.abort_reason
-                )
-                state.guard_summary = (
-                    continuation.guard_summary or state.guard_summary
-                )
-                state.guard_findings = continuation.guard_findings
-            final_diagnostic = evaluate_candidate(
-                name,
-                state.tokens,
-                state.prompt_length,
-                state.ended,
-                model._tokenizer._vocab,
-                verification_match=checkpoint_candidate.verification_match,
-                forced_invalid_reason=state.abort_reason,
-                model_name=checkpoint_candidate.model_name,
-                sampling=checkpoint_candidate.sampling,
-                condition_seek_time=checkpoint_candidate.condition_seek_time,
-                guard_findings=state.guard_findings,
-            )
-            if final_diagnostic.structural_valid:
-                candidate_quality_end = min(
-                    next_seek or audio_duration,
-                    state.origin + _SEGMENT_DURATION,
-                    audio_duration,
-                )
-                (
-                    candidate_quality,
-                    candidate_action,
-                    candidate_findings,
-                    candidate_assessment,
-                ) = _evaluate_chunk_quality(
-                    model._tokenizer,
-                    state.tokens,
-                    state.origin,
-                    ownership_start,
-                    candidate_quality_end,
-                    max(0, len(state.tokens) - state.prompt_length),
-                    recovery_quality_guard,
-                    chunk_quality_history.reference(),
-                    state.guard_summary,
-                )
-                semantic_reason = (
-                    _critical_guard_reason(candidate_findings)
-                    if candidate_action == "reject_candidate"
-                    else None
-                )
-                state.chunk_quality_safe = (
-                    _critical_guard_reason(candidate_findings) is None
-                )
-                final_diagnostic = evaluate_candidate(
-                    name,
-                    state.tokens,
-                    state.prompt_length,
-                    state.ended,
-                    model._tokenizer._vocab,
-                    verification_match=(
-                        checkpoint_candidate.verification_match
-                    ),
-                    forced_invalid_reason=semantic_reason,
-                    model_name=checkpoint_candidate.model_name,
-                    sampling=checkpoint_candidate.sampling,
-                    condition_seek_time=(
-                        checkpoint_candidate.condition_seek_time
-                    ),
-                    chunk_quality=candidate_quality,
-                    chunk_guard_reasons=tuple(
-                        finding.reason for finding in candidate_findings
-                    ),
-                    guard_findings=(
-                        *state.guard_findings,
-                        *candidate_findings,
-                    ),
-                    chunk_quality_reference_samples=len(
-                        chunk_quality_history.reference().samples
-                    ),
-                    chunk_quality_assessment=candidate_assessment,
-                )
-            state.diagnostic = final_diagnostic
-            state.chunk_quality_safe = (
-                final_diagnostic.structural_valid
-                and final_diagnostic.reference_eligible
-            )
-            if (
-                recovery_selection == "completed_quality"
-                and name == secondary_name
-                and not state.chunk_quality_safe
-            ):
-                candidate_names.append("shifted_replay")
-            if (
-                recovery_selection == "checkpoint"
-                and not state.chunk_quality_safe
-            ):
-                # Same shape as the completed-quality clause above: the
-                # attempted candidate's completed chunk failed, the next
-                # eligible one is still paused at its checkpoint -- try it
-                # before settling for a frontier prefix or a discard.
-                candidate_names.extend(_fallback_candidates()[:1])
-
-        for name in ("shifted_replay", secondary_name):
-            state = candidate_states[name]
-            if state.handle is not None:
-                yield from _discard_resident_generation(state.handle)
-                state.handle = None
-            if (
-                name not in attempted_names
-                and state.reached_checkpoint
-                and state.abort_reason is None
-            ):
-                checkpoint = state.diagnostic
-                state.diagnostic = evaluate_candidate(
-                    name,
-                    state.evaluation_tokens,
-                    state.prompt_length,
-                    False,
-                    model._tokenizer._vocab,
-                    verification_match=checkpoint.verification_match,
-                    forced_invalid_reason="not_resumed_after_checkpoint",
-                    model_name=checkpoint.model_name,
-                    sampling=checkpoint.sampling,
-                    condition_seek_time=checkpoint.condition_seek_time,
-                )
-        if primary_handle is not None:
-            yield from _discard_resident_generation(primary_handle)
-            primary_handle = None
-        primary_generation.close()
-
-        candidate_diagnostics = [
-            primary_diagnostic,
-            candidate_states["shifted_replay"].diagnostic,
-            candidate_states[secondary_name].diagnostic,
-        ]
-        if recovery_selection == "checkpoint":
-            # The winner when its completed chunk survived; otherwise the
-            # first fallback whose did. `candidate_names` is attempt order,
-            # which is preference order by construction.
-            if (
-                checkpoint_selected_name == "primary"
-                and primary_diagnostic.structural_valid
-                and primary_diagnostic.reference_eligible
-            ):
-                selected_name = "primary"
-            else:
-                selected_name = next(
-                    (
-                        name
-                        for name in candidate_names
-                        if name in attempted_names
-                        and candidate_states[name].diagnostic.structural_valid
-                        and candidate_states[name].diagnostic.reference_eligible
-                    ),
-                    None,
-                )
-        else:
-            recovery_order = recovery_candidate_order(
-                primary_diagnostic,
-                candidate_states["shifted_replay"].diagnostic,
-                candidate_states[secondary_name].diagnostic,
-            )
-            selected_name = recovery_order[0].name if recovery_order else None
-        selection_reason = {
-            "secondary_model": "secondary_recovery_reference_eligible",
-            "new_seed": "secondary_recovery_reference_eligible",
-            "shifted_replay": "shifted_replay_reference_eligible",
-            "primary": "primary_reference_eligible",
-        }.get(selected_name, "fresh_reanchor_required")
+        attempted_names, candidate_names = yield from _attempt_candidates(
+            stem,
+            chunk,
+            candidate_states=candidate_states,
+            checkpoint_selected_name=checkpoint_selected_name,
+            primary_diagnostic=primary_diagnostic,
+            secondary_name=secondary_name,
+        )
+        yield from _discard_losers(
+            stem,
+            candidate_states=candidate_states,
+            attempted_names=attempted_names,
+            secondary_name=secondary_name,
+            primary=primary,
+        )
+        candidate_diagnostics, selected_name, selection_reason = _select_candidate(
+            stem,
+            candidate_states=candidate_states,
+            secondary_name=secondary_name,
+            checkpoint_selected_name=checkpoint_selected_name,
+            attempted_names=attempted_names,
+            candidate_names=candidate_names,
+            primary_diagnostic=primary_diagnostic,
+        )
 
         if selected_name is None:
             frontier = _safe_frontier(
